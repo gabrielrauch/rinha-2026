@@ -2,3 +2,4 @@
 /blob.bin
 /dist
 .DS_Store
+/resources/references.json.gz
