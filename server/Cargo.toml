@@ -1,0 +1,10 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+shared.workspace = true
+monoio = { version = "0.2", features = ["iouring", "macros"] }
+memmap2 = "0.9"
