@@ -1,6 +1,8 @@
 services:
   api-0:
     image: rinha-2026:dev
+    environment:
+      - RINHA_THREADS=2
     networks: [rinha]
     deploy:
       resources:
@@ -10,6 +12,8 @@ services:
     expose: ["8000"]
   api-1:
     image: rinha-2026:dev
+    environment:
+      - RINHA_THREADS=2
     networks: [rinha]
     deploy:
       resources:
