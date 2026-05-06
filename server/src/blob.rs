@@ -38,11 +38,32 @@ impl Blob {
                 len
             ));
         }
-        Ok(Self {
+        let blob = Self {
             _mmap: mmap,
             base,
             len,
-        })
+        };
+        blob.prefetch();
+        Ok(blob)
+    }
+
+    /// Force every page of the blob into RAM so the hot path never pays a page-fault tail.
+    /// One volatile read per 4KB page is enough to materialize it via the kernel's demand pager.
+    /// Cost: ~10-50ms once at startup; eliminates ~hundreds of ms of jitter at p99.
+    fn prefetch(&self) {
+        const PAGE: usize = 4096;
+        let mut acc: u8 = 0;
+        let mut i = 0;
+        while i < self.len {
+            // SAFETY: i < self.len, base..base+len is a valid mmap region.
+            acc ^= unsafe { std::ptr::read_volatile(self.base.add(i)) };
+            i += PAGE;
+        }
+        // Print to stderr to defeat dead-code elimination of the loop. The value is meaningless.
+        if acc == 0xFE {
+            eprintln!("prefetch sentinel hit");
+        }
+        eprintln!("prefetched {} pages ({} bytes)", self.len.div_ceil(PAGE), self.len);
     }
 
     #[inline]

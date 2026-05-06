@@ -97,7 +97,9 @@ async fn try_handle_one(
 }
 
 async fn send_static(stream: &mut TcpStream, payload: &'static [u8]) {
-    let _ = stream.write_all(payload.to_vec()).await;
+    // monoio's IoBuf is impl'd for &'static [u8], so we can hand the static slice directly
+    // — zero allocation per response.
+    let _ = stream.write_all(payload).await;
 }
 
 fn parse_request_line(line: &[u8]) -> Option<(&[u8], &[u8])> {
