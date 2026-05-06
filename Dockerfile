@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.84-bookworm AS builder
 WORKDIR /work
-COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+# Don't copy rust-toolchain.toml — that would force rustup to redownload all components.
+# The base image already has Rust 1.84 installed.
+COPY Cargo.toml Cargo.lock ./
 
 # --- offline blob build: depends only on shared, builder, and resources.
 # Server changes do NOT invalidate this stage's cache, so iterating on the server
