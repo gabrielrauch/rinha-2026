@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+iouring = []
+
 [dependencies]
 shared.workspace = true
-monoio = { version = "0.2", features = ["iouring", "macros"] }
+monoio = { version = "0.2", features = ["iouring", "legacy", "macros"] }
 memmap2 = "0.9"
 anyhow = "1"
 

@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
-#[cfg_attr(target_os = "linux", monoio::main(driver = "iouring"))]
-#[cfg_attr(not(target_os = "linux"), monoio::main(driver = "legacy"))]
+// Runtime driver: use IORING when explicitly enabled, otherwise the portable legacy (epoll/kqueue)
+// driver. The libkrun VM that podman uses on macOS does not support io_uring (returns ENOSYS),
+// so the default has to be legacy. For the production Rinha submission set RINHA_IOURING=1 in
+// the Dockerfile to opt back into io_uring on the test machine.
+#[cfg_attr(feature = "iouring", monoio::main(driver = "iouring"))]
+#[cfg_attr(not(feature = "iouring"), monoio::main(driver = "legacy"))]
 async fn main() -> anyhow::Result<()> {
     let blob_path = std::env::var("BLOB_PATH").unwrap_or_else(|_| "/index/blob.bin".into());
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8000".into());

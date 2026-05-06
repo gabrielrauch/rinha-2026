@@ -1,19 +1,26 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.84-bookworm AS builder
 WORKDIR /work
-COPY rust-toolchain.toml ./
-COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+
+# --- offline blob build: depends only on shared, builder, and resources.
+# Server changes do NOT invalidate this stage's cache, so iterating on the server
+# does not pay the k-means cost again.
 COPY shared ./shared
-COPY server ./server
 COPY builder ./builder
 COPY resources/normalization.json resources/mcc_risk.json resources/example-references.json resources/example-payloads.json ./resources/
 ADD https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz ./resources/references.json.gz
 
-# Build server (release)
-RUN cargo build -p server --release
+# Stub out the server crate so the workspace is buildable without copying its real source.
+RUN mkdir -p server/src && \
+    printf '[package]\nname = "server"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n[dependencies]\n' > server/Cargo.toml && \
+    printf 'fn main() {}\n' > server/src/main.rs
 
-# Run offline builder to produce blob
 RUN mkdir -p /out && cargo run -p builder --release -- ./resources /out/blob.bin
+
+# --- server build: invalidates only on server source changes.
+COPY server ./server
+RUN cargo build -p server --release
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
 COPY --from=builder /work/target/release/server /server
