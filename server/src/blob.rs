@@ -4,6 +4,11 @@ use shared::{BlobHeader, MAGIC, MCC_TABLE_SIZE, VECTOR_DIM, VERSION};
 use std::fs::File;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+const MADV_HUGEPAGE: libc::c_int = 14;
+#[cfg(target_os = "linux")]
+const MADV_RANDOM: libc::c_int = 1;
+
 pub struct Blob {
     _mmap: Mmap,
     base: *const u8,
@@ -43,9 +48,24 @@ impl Blob {
             base,
             len,
         };
+        blob.advise();
         blob.prefetch();
         Ok(blob)
     }
+
+    /// Hint the kernel about expected access pattern. Best-effort: failure is silent.
+    #[cfg(target_os = "linux")]
+    fn advise(&self) {
+        // SAFETY: base..base+len is a valid mmap region we own.
+        unsafe {
+            // 2MB transparent huge pages — slashes TLB misses on cluster scans.
+            libc::madvise(self.base as *mut _, self.len, MADV_HUGEPAGE);
+            // We jump to one cluster per request; readahead is wasted bandwidth.
+            libc::madvise(self.base as *mut _, self.len, MADV_RANDOM);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn advise(&self) {}
 
     /// Force every page of the blob into RAM so the hot path never pays a page-fault tail.
     /// One volatile read per 4KB page is enough to materialize it via the kernel's demand pager.

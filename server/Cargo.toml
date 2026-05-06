@@ -4,16 +4,15 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[features]
-default = []
-iouring = []
-
 [dependencies]
 shared.workspace = true
 monoio = { version = "0.2", features = ["iouring", "legacy", "macros"] }
 memmap2 = "0.9"
 anyhow = "1"
 socket2 = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 proptest = { version = "=1.3.1", default-features = false, features = ["std", "bit-set", "lazy_static"] }
