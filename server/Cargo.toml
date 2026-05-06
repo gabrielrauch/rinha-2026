@@ -8,3 +8,4 @@ publish.workspace = true
 shared.workspace = true
 monoio = { version = "0.2", features = ["iouring", "macros"] }
 memmap2 = "0.9"
+anyhow = "1"
