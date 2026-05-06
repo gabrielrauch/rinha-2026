@@ -4,3 +4,4 @@ pub mod feature;
 pub mod index;
 pub mod payload;
 pub mod response;
+pub mod wire;
