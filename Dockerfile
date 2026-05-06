@@ -22,10 +22,6 @@ RUN mkdir -p /out && cargo run -p builder --release -- ./resources /out/blob.bin
 
 # --- server build: invalidates only on server source changes.
 COPY server ./server
-# target-cpu=haswell makes LLVM emit AVX2 across the whole binary (Mac Mini Late 2014
-# is Haswell). Hot loops in the JSON parser, byte scanners, monoio buffer ops, etc.
-# all benefit — typically 20-40% latency reduction over generic x86_64.
-ENV RUSTFLAGS="-C target-cpu=haswell"
 RUN cargo build -p server --release
 
 FROM gcr.io/distroless/cc-debian12 AS runtime

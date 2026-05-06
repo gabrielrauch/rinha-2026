@@ -4,15 +4,10 @@ use std::sync::Arc;
 // independently accepting on the SAME local port. The kernel hashes incoming connections
 // across runtimes, giving us true parallelism with no shared mutex on the accept queue.
 //
-// Driver selection is automatic at runtime: try io_uring first (best on Linux 5.6+);
-// fall back to legacy (epoll/kqueue) when io_uring is unavailable, e.g. inside libkrun
-// VMs on macOS or kernels without the syscall.
-//
-// N is read from RINHA_THREADS env var, defaulting to 3 (slightly oversubscribes the
-// 0.475 CPU/container budget on the Mac Mini test box, which has 4 SMT threads —
-// while one thread is in syscall the others compute).
+// N is chosen from RINHA_THREADS env var, falling back to 2 (matches our per-instance CPU
+// budget of ~0.475 with one core spare for the kernel/networking).
 
-const DEFAULT_THREADS: usize = 3;
+const DEFAULT_THREADS: usize = 2;
 
 fn main() -> anyhow::Result<()> {
     let blob_path = std::env::var("BLOB_PATH").unwrap_or_else(|_| "/index/blob.bin".into());
@@ -57,6 +52,7 @@ fn run_runtime(
 ) -> anyhow::Result<()> {
     use socket2::{Domain, Protocol, Socket, Type};
 
+    // Create raw socket with SO_REUSEPORT so multiple runtimes can bind to the same port.
     let domain = if bind_addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -73,73 +69,35 @@ fn run_runtime(
 
     let std_listener: std::net::TcpListener = sock.into();
 
-    // Try io_uring first on Linux; fall back to legacy if the runtime won't build
-    // (e.g. inside libkrun, or on non-Linux dev boxes where IoUringDriver doesn't exist).
-    #[cfg(target_os = "linux")]
-    {
-        match run_iouring(tid, &blob, &std_listener, bind_addr) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                eprintln!("[rt-{tid}] io_uring unavailable ({e}); falling back to legacy");
-            }
-        }
-    }
-    run_legacy(tid, blob, std_listener, bind_addr)
-}
-
-#[cfg(target_os = "linux")]
-fn run_iouring(
-    tid: usize,
-    blob: &Arc<server::blob::Blob>,
-    listener: &std::net::TcpListener,
-    bind_addr: std::net::SocketAddr,
-) -> anyhow::Result<()> {
-    let listener = listener.try_clone()?;
+    // Build a monoio runtime for this OS thread.
+    #[cfg(feature = "iouring")]
     let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
         .enable_timer()
         .build()
-        .map_err(|e| anyhow::anyhow!("io_uring runtime build failed: {e}"))?;
-    let blob = blob.clone();
-    rt.block_on(async move {
-        let listener = monoio::net::TcpListener::from_std(listener)?;
-        eprintln!("[rt-{tid}] iouring listening on {bind_addr}");
-        accept_loop(tid, blob, listener).await;
-        Ok::<_, anyhow::Error>(())
-    })
-}
-
-fn run_legacy(
-    tid: usize,
-    blob: Arc<server::blob::Blob>,
-    listener: std::net::TcpListener,
-    bind_addr: std::net::SocketAddr,
-) -> anyhow::Result<()> {
+        .expect("monoio iouring runtime build");
+    #[cfg(not(feature = "iouring"))]
     let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
         .enable_timer()
         .build()
-        .map_err(|e| anyhow::anyhow!("legacy runtime build failed: {e}"))?;
+        .expect("monoio legacy runtime build");
+
     rt.block_on(async move {
-        let listener = monoio::net::TcpListener::from_std(listener)?;
-        eprintln!("[rt-{tid}] legacy listening on {bind_addr}");
-        accept_loop(tid, blob, listener).await;
+        let listener = monoio::net::TcpListener::from_std(std_listener)?;
+        eprintln!("[rt-{tid}] listening on {bind_addr}");
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let blob = blob.clone();
+                    monoio::spawn(async move {
+                        server::wire::handle_connection(blob, stream).await;
+                    });
+                }
+                Err(e) => eprintln!("[rt-{tid}] accept error: {e}"),
+            }
+        }
+        // unreachable, but typed:
+        #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     })
-}
-
-async fn accept_loop(
-    tid: usize,
-    blob: Arc<server::blob::Blob>,
-    listener: monoio::net::TcpListener,
-) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let blob = blob.clone();
-                monoio::spawn(async move {
-                    server::wire::handle_connection(blob, stream).await;
-                });
-            }
-            Err(e) => eprintln!("[rt-{tid}] accept error: {e}"),
-        }
-    }
 }
