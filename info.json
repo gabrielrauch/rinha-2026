@@ -1,0 +1,10 @@
+{
+  "participants": ["gabriel.rauch"],
+  "social": [
+    "https://github.com/gabrielrauch",
+    "https://linkedin.com/in/gabrielrauch/"
+  ],
+  "source-code-repo": "https://github.com/gabrielrauch/rinha-2026",
+  "stack": ["Rust", "monoio", "io_uring", "HAProxy", "AVX2"],
+  "open_to_work": true
+}
