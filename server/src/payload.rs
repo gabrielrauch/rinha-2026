@@ -15,7 +15,8 @@ pub struct RawPayload<'a> {
     pub is_online: bool,
     pub card_present: bool,
     pub km_from_home: f32,
-    pub last_minutes: Option<f32>,
+    /// ISO-8601 timestamp slice when `last_transaction` is present; None when null.
+    pub last_timestamp: Option<&'a [u8]>,
     pub last_km: Option<f32>,
 }
 
@@ -127,23 +128,19 @@ fn parse_last_transaction<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Op
         return Some(());
     }
     s.expect(b'{')?;
-    let mut ts: Option<&'a [u8]> = None;
     loop {
         s.skip_ws();
         if s.peek() == Some(b'}') { s.bump(); break; }
         let k = s.read_string()?;
         s.skip_ws(); s.expect(b':')?; s.skip_ws();
         match k {
-            b"timestamp" => ts = Some(s.read_string()?),
+            b"timestamp" => p.last_timestamp = Some(s.read_string()?),
             b"km_from_current" => p.last_km = Some(s.read_f32()?),
             _ => s.skip_value()?,
         }
         s.skip_ws();
         if s.peek() == Some(b',') { s.bump(); }
     }
-    // Refinement target: compute (requested_at - last.timestamp)/60 here.
-    // Placeholder of 0.0 marks "present but unknown delta".
-    p.last_minutes = ts.map(|_| 0.0_f32);
     Some(())
 }
 
@@ -270,7 +267,7 @@ mod tests {
         assert_eq!(p.merchant_mcc, b"5411");
         assert!(!p.is_online);
         assert!(p.card_present);
-        assert!(p.last_minutes.is_none());
+        assert!(p.last_timestamp.is_none());
         assert!(p.last_km.is_none());
     }
 }
