@@ -39,29 +39,46 @@ pub fn kmeans(
 
     let mut rng = Rng(seed | 1);
 
-    // k-means++ init
+    // k-means++ init with cumulative best_d (O(N*k) instead of O(N*k^2))
     let mut centroids: Vec<[i8; VECTOR_DIM]> = Vec::with_capacity(k);
-    centroids.push(vectors[rng.range(vectors.len())]);
+    let first_idx = rng.range(vectors.len());
+    centroids.push(vectors[first_idx]);
+
+    // Maintain "distance to nearest centroid so far" per vector. Initialize against the first centroid.
+    let first = centroids[0];
+    let mut best_d: Vec<i32> = vectors.par_iter().map(|v| dist_sq(v, &first)).collect();
+
     while centroids.len() < k {
-        // PARALLEL: for each vector, find squared distance to nearest centroid so far
-        let best_d: Vec<i32> = vectors
-            .par_iter()
-            .map(|v| centroids.iter().map(|c| dist_sq(v, c)).min().unwrap_or(0))
-            .collect();
+        // Pick next centroid weighted by best_d
         let total: u64 = best_d.par_iter().map(|&x| x as u64).sum();
-        if total == 0 {
-            centroids.push(vectors[rng.range(vectors.len())]);
-            continue;
-        }
-        let pick = rng.next() % total;
-        let mut acc: u64 = 0;
-        for (i, &d) in best_d.iter().enumerate() {
-            acc += d as u64;
-            if acc >= pick {
-                centroids.push(vectors[i]);
-                break;
+        let new_centroid = if total == 0 {
+            vectors[rng.range(vectors.len())]
+        } else {
+            let pick = rng.next() % total;
+            let mut acc: u64 = 0;
+            let mut chosen = vectors[rng.range(vectors.len())];
+            for (i, &d) in best_d.iter().enumerate() {
+                acc += d as u64;
+                if acc >= pick {
+                    chosen = vectors[i];
+                    break;
+                }
             }
-        }
+            chosen
+        };
+        centroids.push(new_centroid);
+
+        // Update best_d: only compare against the newly added centroid (parallel)
+        let new_c = new_centroid;
+        best_d
+            .par_iter_mut()
+            .zip(vectors.par_iter())
+            .for_each(|(d, v)| {
+                let nd = dist_sq(v, &new_c);
+                if nd < *d {
+                    *d = nd;
+                }
+            });
     }
 
     let mut assignments = vec![0u32; vectors.len()];
