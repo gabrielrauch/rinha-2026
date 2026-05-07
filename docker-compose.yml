@@ -2,7 +2,7 @@ services:
   api-0:
     image: rinha-2026:dev
     environment:
-      - RINHA_THREADS=2
+      - RINHA_THREADS=1
     networks: [rinha]
     deploy:
       resources:
@@ -13,7 +13,7 @@ services:
   api-1:
     image: rinha-2026:dev
     environment:
-      - RINHA_THREADS=2
+      - RINHA_THREADS=1
     networks: [rinha]
     deploy:
       resources:
