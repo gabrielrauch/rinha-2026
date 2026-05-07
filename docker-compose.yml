@@ -1,8 +1,8 @@
 services:
   api-0:
-    image: ghcr.io/gabrielrauch/rinha-2026:latest
+    image: rinha-2026:dev
     environment:
-      - RINHA_THREADS=2
+      - RINHA_THREADS=1
     networks: [rinha]
     deploy:
       resources:
@@ -11,9 +11,9 @@ services:
           memory: '165M'
     expose: ["8000"]
   api-1:
-    image: ghcr.io/gabrielrauch/rinha-2026:latest
+    image: rinha-2026:dev
     environment:
-      - RINHA_THREADS=2
+      - RINHA_THREADS=1
     networks: [rinha]
     deploy:
       resources:
