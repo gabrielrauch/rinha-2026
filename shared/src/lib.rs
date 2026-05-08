@@ -14,7 +14,7 @@
 pub const MAGIC: [u8; 8] = *b"RINHA026";
 pub const VERSION: u32 = 1;
 pub const VECTOR_DIM: usize = 14;
-pub const NUM_CENTROIDS: u32 = 4096;
+pub const NUM_CENTROIDS: u32 = 2048;
 pub const MCC_TABLE_SIZE: usize = 1024;
 
 #[repr(C)]
