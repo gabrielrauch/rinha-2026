@@ -4,10 +4,12 @@ use crate::index::fraud_score;
 use crate::payload::extract;
 use crate::response;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::TcpStream;
 use std::sync::Arc;
 
-pub async fn handle_connection(blob: Arc<Blob>, mut stream: TcpStream) {
+pub async fn handle_connection<S>(blob: Arc<Blob>, mut stream: S)
+where
+    S: AsyncReadRent + AsyncWriteRentExt,
+{
     let mut req_buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
         let read_buf = vec![0u8; 4096];
@@ -43,11 +45,10 @@ enum HandleResult {
     Drop,
 }
 
-async fn try_handle_one(
-    blob: &Arc<Blob>,
-    stream: &mut TcpStream,
-    buf: &[u8],
-) -> HandleResult {
+async fn try_handle_one<S>(blob: &Arc<Blob>, stream: &mut S, buf: &[u8]) -> HandleResult
+where
+    S: AsyncWriteRentExt,
+{
     // Need full headers
     let header_end = match find_double_crlf(buf) {
         Some(p) => p,
@@ -96,7 +97,7 @@ async fn try_handle_one(
     HandleResult::Consumed(header_end)
 }
 
-async fn send_static(stream: &mut TcpStream, payload: &'static [u8]) {
+async fn send_static<S: AsyncWriteRentExt>(stream: &mut S, payload: &'static [u8]) {
     // monoio's IoBuf is impl'd for &'static [u8], so we can hand the static slice directly
     // — zero allocation per response.
     let _ = stream.write_all(payload).await;
