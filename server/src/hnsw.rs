@@ -19,7 +19,7 @@ use shared::{HNSW_M, HNSW_M0, HNSW_SENTINEL, VECTOR_DIM};
 use std::cell::RefCell;
 
 /// Beam width at layer 0. Higher = more recall, more compute.
-pub const EF_SEARCH: usize = 64;
+pub const EF_SEARCH: usize = 128;
 /// We always pull the top-5 frauds (rinha k-NN with k=5).
 pub const TOP_K: usize = 5;
 
