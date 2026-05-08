@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use builder::{blob, kmeans, quantize, sources};
+use builder::{blob, hnsw, quantize, sources};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -27,22 +27,15 @@ fn main() -> anyhow::Result<()> {
     }
     drop(entries);
 
-    eprintln!("running k-means");
+    eprintln!("building HNSW graph (M0={}, M={})", shared::HNSW_M0, shared::HNSW_M);
     let t = Instant::now();
-    let k = (shared::NUM_CENTROIDS as usize).min(vectors.len());
-    let (centroids, assignments) = kmeans::kmeans(
-        &vectors,
-        k,
-        15,
-        0xDEADBEEF,
-    );
-    eprintln!("k-means took {:?}", t.elapsed());
+    let graph = hnsw::build(&vectors, 0xDEADBEEF);
+    eprintln!("hnsw build took {:?}", t.elapsed());
 
     let blob_bytes = blob::build_blob(&blob::BuildInputs {
-        centroids: &centroids,
         vectors: &vectors,
-        assignments: &assignments,
         is_fraud: &is_fraud,
+        graph: &graph,
         mcc_risk: &mcc,
     });
 

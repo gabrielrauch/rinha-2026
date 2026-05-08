@@ -19,9 +19,12 @@ fn main() -> anyhow::Result<()> {
 
     let blob = Arc::new(server::blob::Blob::open(blob_path.as_ref())?);
     eprintln!(
-        "loaded blob: {} centroids, {} vectors",
-        blob.header().num_centroids,
-        blob.header().total_vectors
+        "loaded blob: {} vectors, hnsw layers={} entry={} M0={} M={}",
+        blob.header().total_vectors,
+        blob.header().hnsw_num_layers,
+        blob.header().hnsw_entry_point,
+        blob.header().hnsw_m0,
+        blob.header().hnsw_m,
     );
 
     let bind_addr: std::net::SocketAddr = bind_str.parse()?;

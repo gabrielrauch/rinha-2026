@@ -472,6 +472,7 @@ dependencies = [
  "monoio",
  "proptest",
  "shared",
+ "socket2",
 ]
 
 [[package]]

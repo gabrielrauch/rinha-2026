@@ -1,49 +1,76 @@
 //! Types shared between the offline builder and the runtime server.
 //!
-//! Blob layout (little-endian):
+//! Blob layout v2 (HNSW, little-endian):
 //!
 //! ```text
-//! [BlobHeader: 64 bytes]
-//! [centroids: NUM_CENTROIDS * 14 bytes (i8)]
-//! [cluster_offsets: (NUM_CENTROIDS + 1) * 4 bytes (u32)]
-//! [vectors: total_vectors * 14 bytes (i8), grouped by cluster]
+//! [BlobHeader: 256 bytes]
+//! [vectors: total_vectors * 14 bytes (i8)]
 //! [labels: ceil(total_vectors / 8) bytes, 1 bit per vector (1 = fraud)]
 //! [mcc_risk_table: 1024 bytes (i8 × 1024) — direct-index by mcc % 1024]
+//! [layer 0 neighbors: total_vectors * M0 * 3 bytes (u24, packed)]
+//! [layer L>=1 nodes: layer_count[L] * 4 bytes (u32 — zero-node ids)]
+//! [layer L>=1 neighbors: layer_count[L] * M * 3 bytes (u24, packed)]
 //! ```
+//!
+//! Neighbor IDs are u24 packed (3 bytes little-endian). Sentinel for
+//! "unused slot" is 0xFFFFFF; valid node IDs occupy [0, total_vectors)
+//! with total_vectors capped at 16M-1 (well above the 3M dataset).
 
 pub const MAGIC: [u8; 8] = *b"RINHA026";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const VECTOR_DIM: usize = 14;
-pub const NUM_CENTROIDS: u32 = 2048;
 pub const MCC_TABLE_SIZE: usize = 1024;
+
+/// HNSW neighbor count at layer 0. Stored u24 packed.
+pub const HNSW_M0: usize = 8;
+/// HNSW neighbor count at layers > 0.
+pub const HNSW_M: usize = 8;
+/// Sentinel u24 for "no neighbor in this slot".
+pub const HNSW_SENTINEL: u32 = 0x00FFFFFF;
+/// Maximum number of layers we serialize (covers any 3M-vector graph: P(level≥k)=M^-k).
+pub const HNSW_MAX_LAYERS: usize = 8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlobHeader {
     pub magic: [u8; 8],
     pub version: u32,
-    pub num_centroids: u32,
     pub total_vectors: u32,
-    pub centroids_offset: u32,
-    pub cluster_offsets_offset: u32,
+
     pub vectors_offset: u32,
     pub labels_offset: u32,
     pub mcc_table_offset: u32,
+
+    // HNSW
+    pub hnsw_entry_point: u32,
+    pub hnsw_num_layers: u8,
+    pub hnsw_m0: u8,
+    pub hnsw_m: u8,
+    pub _hnsw_pad: u8,
+
+    // Per-layer metadata (HNSW_MAX_LAYERS slots, only first `hnsw_num_layers` used)
+    pub layer_node_count: [u32; HNSW_MAX_LAYERS],
+    pub layer_nodes_offset: [u32; HNSW_MAX_LAYERS],
+    pub layer_neighbors_offset: [u32; HNSW_MAX_LAYERS],
+
     pub blob_size: u32,
-    pub _padding: [u8; 20],
+    pub _padding: [u8; 120],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<BlobHeader>() == 64);
+    assert!(std::mem::size_of::<BlobHeader>() == 256);
 };
 
 #[cfg(test)]
-mod tests {
+mod header_tests {
     use super::*;
 
     #[test]
-    fn header_size_is_fixed_64_bytes() {
-        assert_eq!(std::mem::size_of::<BlobHeader>(), 64);
+    fn header_size_known() {
+        // sanity: must be a multiple of 8 (alignment-friendly) and reasonable
+        let sz = std::mem::size_of::<BlobHeader>();
+        assert!(sz % 8 == 0, "header size {} not 8-aligned", sz);
+        assert!(sz >= 200 && sz <= 320, "unexpected header size {sz}");
     }
 
     #[test]

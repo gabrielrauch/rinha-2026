@@ -6,9 +6,8 @@ fn loads_smoke_blob() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tmp/blob.bin");
     let blob = Blob::open(&path).unwrap();
     assert_eq!(blob.header().magic, shared::MAGIC);
-    assert!(!blob.centroids().is_empty());
+    assert_eq!(blob.header().version, shared::VERSION);
     assert!(!blob.vectors().is_empty());
-    assert_eq!(blob.cluster_offsets().len(), blob.centroids().len() + 1);
-    let total_from_offsets = *blob.cluster_offsets().last().unwrap() as usize;
-    assert_eq!(total_from_offsets, blob.header().total_vectors as usize);
+    assert!(blob.hnsw_num_layers() >= 1);
+    assert!(blob.hnsw_entry_point() < blob.header().total_vectors);
 }
