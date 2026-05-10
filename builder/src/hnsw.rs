@@ -15,7 +15,7 @@ use shared::{HNSW_M, HNSW_M0, HNSW_SENTINEL, VECTOR_DIM};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-const EF_CONSTRUCTION: usize = 200;
+const EF_CONSTRUCTION: usize = 400;
 
 /// Final, compact graph ready for serialization.
 pub struct BuiltGraph {
