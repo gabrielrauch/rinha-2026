@@ -18,8 +18,12 @@ use crate::distance::l2_squared;
 use shared::{HNSW_M, HNSW_M0, HNSW_SENTINEL, VECTOR_DIM};
 use std::cell::RefCell;
 
-/// Beam width at layer 0. Higher = more recall, more compute.
-pub const EF_SEARCH: usize = 200;
+/// Beam width at layer 0 — fast path. Most queries finish here.
+pub const EF_FAST: usize = 100;
+/// Beam width at layer 0 — fallback for ambiguous (count ∈ {2,3}) queries.
+pub const EF_FULL: usize = 300;
+/// Default for callers that don't care about adaptivity.
+pub const EF_SEARCH: usize = EF_FAST;
 /// We always pull the top-5 frauds (rinha k-NN with k=5).
 pub const TOP_K: usize = 5;
 
@@ -44,8 +48,8 @@ impl SearchState {
         Self {
             visited: vec![0u64; n_words],
             visited_ids: Vec::with_capacity(8192),
-            candidates: Vec::with_capacity(EF_SEARCH * 2),
-            found: Vec::with_capacity(EF_SEARCH * 2),
+            candidates: Vec::with_capacity(EF_FULL * 2),
+            found: Vec::with_capacity(EF_FULL * 2),
         }
     }
 
@@ -85,6 +89,12 @@ thread_local! {
 /// Public entry. Returns the top-K (distance, zero_node_id) pairs sorted ascending
 /// by distance. Pads with `(u32::MAX, u32::MAX)` if fewer than K were found.
 pub fn search_top_k(blob: &Blob, query: &[i8; VECTOR_DIM]) -> [(u32, u32); TOP_K] {
+    search_top_k_ef(blob, query, EF_SEARCH)
+}
+
+/// Same as `search_top_k` but with caller-specified beam width. Used for the
+/// adaptive fast/full re-search in `index::fraud_score`.
+pub fn search_top_k_ef(blob: &Blob, query: &[i8; VECTOR_DIM], ef: usize) -> [(u32, u32); TOP_K] {
     STATE.with(|s| {
         let mut borrow = s.borrow_mut();
         let state = borrow.get_or_insert_with(|| {
@@ -94,7 +104,7 @@ pub fn search_top_k(blob: &Blob, query: &[i8; VECTOR_DIM]) -> [(u32, u32); TOP_K
         state.reset();
 
         let mut result = [(u32::MAX, u32::MAX); TOP_K];
-        do_search(blob, query, state, &mut result);
+        do_search(blob, query, state, &mut result, ef);
         result
     })
 }
@@ -110,6 +120,7 @@ fn do_search(
     query: &[i8; VECTOR_DIM],
     state: &mut SearchState,
     out: &mut [(u32, u32); TOP_K],
+    ef: usize,
 ) {
     let num_layers = blob.hnsw_num_layers();
     if num_layers == 0 || blob.header().total_vectors == 0 {
@@ -160,14 +171,14 @@ fn do_search(
         }
     }
 
-    // 2. Beam search at layer 0 with ef = EF_SEARCH.
+    // 2. Beam search at layer 0 with ef = ef.
     state.mark_visited(ep);
     state.candidates.push((ep_dist, ep));
     state.found.push((ep_dist, ep));
 
     while let Some((d_c, c)) = pop_min(&mut state.candidates) {
         let worst = peek_max(&state.found).map(|x| x.0).unwrap_or(u32::MAX);
-        if d_c > worst && state.found.len() >= EF_SEARCH {
+        if d_c > worst && state.found.len() >= ef {
             break;
         }
         // Walk the M0 neighbors of c at layer 0.
@@ -182,10 +193,10 @@ fn do_search(
             }
             let d = distance_to(blob, query, n);
             let worst = peek_max(&state.found).map(|x| x.0).unwrap_or(u32::MAX);
-            if d < worst || state.found.len() < EF_SEARCH {
+            if d < worst || state.found.len() < ef {
                 push_min(&mut state.candidates, (d, n));
                 push_max(&mut state.found, (d, n));
-                if state.found.len() > EF_SEARCH {
+                if state.found.len() > ef {
                     pop_max(&mut state.found);
                 }
             }
