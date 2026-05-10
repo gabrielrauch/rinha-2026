@@ -21,7 +21,11 @@ RUN mkdir -p server/src && \
 RUN mkdir -p /out && cargo run -p builder --release -- ./resources /out/blob.bin
 
 # --- server build: invalidates only on server source changes.
+# target-cpu=haswell unlocks AVX2/FMA/BMI2 unconditionally — Mac Mini Late 2014
+# is Haswell, so this is safe and lets LLVM emit better SIMD without runtime
+# feature dispatch.
 COPY server ./server
+ENV RUSTFLAGS="-C target-cpu=haswell"
 RUN cargo build -p server --release
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
