@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: ghcr.io/gabrielrauch/rinha-2026:cba1bd8786b5a0e259cc0ce0364ef9326d22a7d4
+    image: ghcr.io/gabrielrauch/rinha-2026:068a0901b0a5f8408562a85db12316f99f77d138
     environment:
       - RINHA_SOCK=/run/sock/api1.sock
     volumes:
