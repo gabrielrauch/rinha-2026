@@ -26,10 +26,11 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(feature = "iouring")]
-type Driver = monoio::IoUringDriver;
-#[cfg(not(feature = "iouring"))]
-type Driver = monoio::LegacyDriver;
+// FusionDriver picks IoUringDriver at runtime when the kernel supports it
+// (Mac Mini Haswell: yes), and falls back to LegacyDriver otherwise. This
+// matters for UDS: monoio's LegacyDriver has a known quirk where
+// UnixListener::accept doesn't wake reliably; IoUringDriver does.
+type Driver = monoio::FusionDriver;
 
 fn run_uds(blob: Arc<server::blob::Blob>, sock_path: PathBuf) -> anyhow::Result<()> {
     use monoio::net::{ListenerOpts, UnixListener};
