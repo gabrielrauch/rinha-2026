@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use builder::{blob, hnsw, quantize, sources};
+use builder::{blob, kmeans, quantize, sources};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -18,28 +18,34 @@ fn main() -> anyhow::Result<()> {
     let entries = sources::load_references_gz(&refs_path)?;
     eprintln!("loaded {} reference entries", entries.len());
 
-    let mut vectors = Vec::with_capacity(entries.len());
+    let mut vectors_f32 = Vec::with_capacity(entries.len());
     let mut is_fraud = Vec::with_capacity(entries.len());
     for e in &entries {
-        let (v, f) = quantize::quantize_entry(e);
-        vectors.push(v);
+        let (v, f) = quantize::entry_to_f32(e);
+        vectors_f32.push(v);
         is_fraud.push(f);
     }
     drop(entries);
 
-    eprintln!("building HNSW graph (M0={}, M={})", shared::HNSW_M0, shared::HNSW_M);
+    let k = shared::NUM_CENTROIDS as usize;
+    eprintln!("running k-means K={} on {} vectors", k, vectors_f32.len());
     let t = Instant::now();
-    let graph = hnsw::build(&vectors, 0xDEADBEEF);
-    eprintln!("hnsw build took {:?}", t.elapsed());
+    let (centroids, assignments) = kmeans::kmeans(&vectors_f32, k, 20, 0xDEADBEEF);
+    eprintln!("k-means took {:?}", t.elapsed());
 
     let blob_bytes = blob::build_blob(&blob::BuildInputs {
-        vectors: &vectors,
+        centroids: &centroids,
+        assignments: &assignments,
+        vectors_f32: &vectors_f32,
         is_fraud: &is_fraud,
-        graph: &graph,
         mcc_risk: &mcc,
     });
 
     fs::write(&out_path, &blob_bytes)?;
-    eprintln!("wrote {} ({} bytes)", out_path.display(), blob_bytes.len());
+    eprintln!(
+        "wrote {} ({:.1} MB)",
+        out_path.display(),
+        blob_bytes.len() as f64 / 1_048_576.0
+    );
     Ok(())
 }

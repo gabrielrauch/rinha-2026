@@ -9,12 +9,10 @@ fn main() -> anyhow::Result<()> {
     let blob_path = std::env::var("BLOB_PATH").unwrap_or_else(|_| "/index/blob.bin".into());
     let blob = Arc::new(server::blob::Blob::open(blob_path.as_ref())?);
     eprintln!(
-        "loaded blob: {} vectors, hnsw layers={} entry={} M0={} M={}",
+        "loaded blob: {} vectors, {} blocks, K={} centroids",
         blob.header().total_vectors,
-        blob.header().hnsw_num_layers,
-        blob.header().hnsw_entry_point,
-        blob.header().hnsw_m0,
-        blob.header().hnsw_m,
+        blob.header().total_blocks,
+        blob.header().k_centroids,
     );
 
     if let Ok(sock_path) = std::env::var("RINHA_SOCK") {

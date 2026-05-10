@@ -1,34 +1,37 @@
 //! Types shared between the offline builder and the runtime server.
 //!
-//! Blob layout v2 (HNSW, little-endian):
+//! Blob layout v3 (IVF SoA, little-endian):
 //!
 //! ```text
 //! [BlobHeader: 256 bytes]
-//! [vectors: total_vectors * 14 bytes (i8)]
-//! [labels: ceil(total_vectors / 8) bytes, 1 bit per vector (1 = fraud)]
-//! [mcc_risk_table: 1024 bytes (i8 × 1024) — direct-index by mcc % 1024]
-//! [layer 0 neighbors: total_vectors * M0 * 3 bytes (u24, packed)]
-//! [layer L>=1 nodes: layer_count[L] * 4 bytes (u32 — zero-node ids)]
-//! [layer L>=1 neighbors: layer_count[L] * M * 3 bytes (u24, packed)]
+//! [centroids: NUM_CENTROIDS * VECTOR_DIM * 4 bytes (f32, dim-major SoA: dim 0 of all 8192, dim 1 of all 8192, ...)]
+//! [cluster_offsets: (NUM_CENTROIDS + 1) * 4 bytes (u32) — block offsets per cluster]
+//! [blocks: total_blocks * BLOCK_BYTES bytes — each block packs 8 vectors as i16 SoA: dim 0 slot 0..7, dim 1 slot 0..7, ...]
+//! [labels: padded_n bits packed in bytes, 1 bit per slot (block_id*8 + slot), 1 = fraud]
+//! [mcc_risk_table: 1024 bytes (i8 × 1024)]
 //! ```
 //!
-//! Neighbor IDs are u24 packed (3 bytes little-endian). Sentinel for
-//! "unused slot" is 0xFFFFFF; valid node IDs occupy [0, total_vectors)
-//! with total_vectors capped at 16M-1 (well above the 3M dataset).
+//! Vectors are stored quantized as i16 with scale 8192 (~13 fractional bits) so
+//! each block is `BLOCK_VECS * VECTOR_DIM * 2` bytes. SoA layout lets a single
+//! `_mm_loadu_si128` pull all 8 lanes of one dimension; we then upcast to f32
+//! for FMA accumulation. Last block of each cluster pads with i16::MAX so the
+//! distance compute is enormous and those slots never enter the top-K.
 
 pub const MAGIC: [u8; 8] = *b"RINHA026";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const VECTOR_DIM: usize = 14;
 pub const MCC_TABLE_SIZE: usize = 1024;
 
-/// HNSW neighbor count at layer 0. Stored u24 packed.
-pub const HNSW_M0: usize = 8;
-/// HNSW neighbor count at layers > 0.
-pub const HNSW_M: usize = 8;
-/// Sentinel u24 for "no neighbor in this slot".
-pub const HNSW_SENTINEL: u32 = 0x00FFFFFF;
-/// Maximum number of layers we serialize (covers any 3M-vector graph: P(level≥k)=M^-k).
-pub const HNSW_MAX_LAYERS: usize = 8;
+/// IVF parameters
+pub const NUM_CENTROIDS: u32 = 8192;
+pub const BLOCK_VECS: usize = 8;
+pub const BLOCK_BYTES: usize = BLOCK_VECS * VECTOR_DIM * 2; // 8 vecs * 14 dims * i16 = 224 bytes
+/// Quantization scale. Vectors are clamped to [-1, 1] then multiplied by SCALE
+/// before rounding to i16. SCALE=8192 leaves headroom (i16 max = 32767, max possible
+/// product after squaring = 67M; with FMA over 14 dims worst-case = 938M which fits in f32).
+pub const QUANT_SCALE: f32 = 8192.0;
+/// Inverse of `QUANT_SCALE`, applied at search time.
+pub const QUANT_INV_SCALE: f32 = 1.0 / 8192.0;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -36,25 +39,18 @@ pub struct BlobHeader {
     pub magic: [u8; 8],
     pub version: u32,
     pub total_vectors: u32,
+    pub padded_n: u32, // total_blocks * BLOCK_VECS
+    pub total_blocks: u32,
+    pub k_centroids: u32, // NUM_CENTROIDS
 
-    pub vectors_offset: u32,
-    pub labels_offset: u32,
-    pub mcc_table_offset: u32,
-
-    // HNSW
-    pub hnsw_entry_point: u32,
-    pub hnsw_num_layers: u8,
-    pub hnsw_m0: u8,
-    pub hnsw_m: u8,
-    pub _hnsw_pad: u8,
-
-    // Per-layer metadata (HNSW_MAX_LAYERS slots, only first `hnsw_num_layers` used)
-    pub layer_node_count: [u32; HNSW_MAX_LAYERS],
-    pub layer_nodes_offset: [u32; HNSW_MAX_LAYERS],
-    pub layer_neighbors_offset: [u32; HNSW_MAX_LAYERS],
+    pub centroids_offset: u32,        // f32 SoA, dim-major
+    pub cluster_offsets_offset: u32,  // u32, length k_centroids + 1, block indices
+    pub blocks_offset: u32,           // i16 SoA blocks
+    pub labels_offset: u32,           // bits, length ceil(padded_n / 8)
+    pub mcc_table_offset: u32,        // i8 * 1024
 
     pub blob_size: u32,
-    pub _padding: [u8; 120],
+    pub _padding: [u8; 204],
 }
 
 const _: () = {
@@ -154,40 +150,54 @@ pub struct RawFeatures {
     pub merchant_avg_amount: f32,
 }
 
+/// Same canonical vectorization, but returning unquantized f32 in the range
+/// [-1.0, 1.0] (with the `-1.0` sentinel where the original returned -127).
+/// The IVF SoA scan does its compute in f32, so we hand it the float values
+/// directly and let the search-side scan apply its own quantization scale.
 #[inline]
-pub fn vectorize(r: &RawFeatures) -> [i8; VECTOR_DIM] {
-    let mut v = [0i8; VECTOR_DIM];
+pub fn vectorize_f32(r: &RawFeatures) -> [f32; VECTOR_DIM] {
+    let mut v = [0.0f32; VECTOR_DIM];
 
-    v[0] = quantize_unit(clamp01(r.amount / MAX_AMOUNT));
-    v[1] = quantize_unit(clamp01(r.installments as f32 / MAX_INSTALLMENTS));
+    v[0] = clamp01(r.amount / MAX_AMOUNT);
+    v[1] = clamp01(r.installments as f32 / MAX_INSTALLMENTS);
 
     let amount_vs_avg = if r.customer_avg_amount > 0.0 {
         clamp01((r.amount / r.customer_avg_amount) / AMOUNT_VS_AVG_RATIO)
     } else {
         0.0
     };
-    v[2] = quantize_unit(amount_vs_avg);
+    v[2] = amount_vs_avg;
 
-    v[3] = quantize_unit(r.hour_of_day as f32 / 23.0);
-    v[4] = quantize_unit(r.day_of_week as f32 / 6.0);
+    v[3] = r.hour_of_day as f32 / 23.0;
+    v[4] = r.day_of_week as f32 / 6.0;
 
     v[5] = match r.minutes_since_last_tx {
-        Some(m) => quantize_unit(clamp01(m / MAX_MINUTES)),
-        None => -127,
+        Some(m) => clamp01(m / MAX_MINUTES),
+        None => -1.0,
     };
     v[6] = match r.km_from_last_tx {
-        Some(k) => quantize_unit(clamp01(k / MAX_KM)),
-        None => -127,
+        Some(k) => clamp01(k / MAX_KM),
+        None => -1.0,
     };
 
-    v[7] = quantize_unit(clamp01(r.km_from_home / MAX_KM));
-    v[8] = quantize_unit(clamp01(r.tx_count_24h as f32 / MAX_TX_COUNT_24H));
-    v[9] = if r.is_online { 127 } else { 0 };
-    v[10] = if r.card_present { 127 } else { 0 };
-    v[11] = if r.unknown_merchant { 127 } else { 0 };
-    v[12] = quantize_unit(clamp01(r.mcc_risk));
-    v[13] = quantize_unit(clamp01(r.merchant_avg_amount / MAX_MERCHANT_AVG_AMOUNT));
+    v[7] = clamp01(r.km_from_home / MAX_KM);
+    v[8] = clamp01(r.tx_count_24h as f32 / MAX_TX_COUNT_24H);
+    v[9] = if r.is_online { 1.0 } else { 0.0 };
+    v[10] = if r.card_present { 1.0 } else { 0.0 };
+    v[11] = if r.unknown_merchant { 1.0 } else { 0.0 };
+    v[12] = clamp01(r.mcc_risk);
+    v[13] = clamp01(r.merchant_avg_amount / MAX_MERCHANT_AVG_AMOUNT);
 
+    v
+}
+
+#[inline]
+pub fn vectorize(r: &RawFeatures) -> [i8; VECTOR_DIM] {
+    let v_f32 = vectorize_f32(r);
+    let mut v = [0i8; VECTOR_DIM];
+    for i in 0..VECTOR_DIM {
+        v[i] = quantize_unit(v_f32[i]);
+    }
     v
 }
 

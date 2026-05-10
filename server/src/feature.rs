@@ -1,8 +1,8 @@
 use crate::blob::Blob;
 use crate::payload::RawPayload;
-use shared::{vectorize, RawFeatures, VECTOR_DIM};
+use shared::{vectorize_f32, RawFeatures, VECTOR_DIM};
 
-pub fn vectorize_payload(blob: &Blob, p: &RawPayload<'_>) -> Option<[i8; VECTOR_DIM]> {
+pub fn vectorize_payload(blob: &Blob, p: &RawPayload<'_>) -> Option<[f32; VECTOR_DIM]> {
     let req_minutes = parse_iso8601_minutes(p.requested_at)?;
     let (hour, dow) = hour_and_dow_from_minutes(req_minutes);
     let mcc = parse_ascii_u32(p.merchant_mcc)?;
@@ -36,7 +36,7 @@ pub fn vectorize_payload(blob: &Blob, p: &RawPayload<'_>) -> Option<[i8; VECTOR_
         mcc_risk,
         merchant_avg_amount: p.merchant_avg_amount,
     };
-    Some(vectorize(&raw))
+    Some(vectorize_f32(&raw))
 }
 
 #[inline]
@@ -126,8 +126,8 @@ mod tests {
         let blob = Blob::open(&path).unwrap();
         let p = payload::extract(SAMPLE_NULL).unwrap();
         let v = vectorize_payload(&blob, &p).unwrap();
-        assert_eq!(v[5], -127);
-        assert_eq!(v[6], -127);
+        assert_eq!(v[5], -1.0);
+        assert_eq!(v[6], -1.0);
     }
 
     #[test]
@@ -137,8 +137,8 @@ mod tests {
         let p = payload::extract(SAMPLE_PRESENT).unwrap();
         let v = vectorize_payload(&blob, &p).unwrap();
         // 120 minutes between timestamps → 120/1440 ≈ 0.0833 → quantized ~10
-        assert!((8..=12).contains(&v[5]), "expected ~10 in v[5], got {}", v[5]);
-        assert_ne!(v[6], -127);
+        assert!((0.05f32..0.10).contains(&v[5]), "expected ~0.083 in v[5], got {}", v[5]);
+        assert_ne!(v[6], -1.0);
     }
 
     #[test]
