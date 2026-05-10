@@ -1,30 +1,33 @@
 services:
   api-0:
-    image: ghcr.io/gabrielrauch/rinha-2026:366b4b00fca00210366422230ed50d3201e67143
+    image: ghcr.io/gabrielrauch/rinha-2026:1ccac35382e953388228335e5f0f8282a4e2af0f
     environment:
-      - RINHA_THREADS=1
+      - RINHA_SOCK=/run/sock/api0.sock
+    volumes:
+      - sock:/run/sock
     networks: [rinha]
     deploy:
       resources:
         limits:
           cpus: '0.475'
           memory: '165M'
-    expose: ["8000"]
   api-1:
-    image: ghcr.io/gabrielrauch/rinha-2026:366b4b00fca00210366422230ed50d3201e67143
+    image: ghcr.io/gabrielrauch/rinha-2026:1ccac35382e953388228335e5f0f8282a4e2af0f
     environment:
-      - RINHA_THREADS=1
+      - RINHA_SOCK=/run/sock/api1.sock
+    volumes:
+      - sock:/run/sock
     networks: [rinha]
     deploy:
       resources:
         limits:
           cpus: '0.475'
           memory: '165M'
-    expose: ["8000"]
   lb:
     image: haproxy:2.9-alpine
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sock:/run/sock
     ports:
       - "9999:9999"
     depends_on: [api-0, api-1]
@@ -38,3 +41,6 @@ services:
 networks:
   rinha:
     driver: bridge
+
+volumes:
+  sock:
