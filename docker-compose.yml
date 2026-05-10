@@ -1,6 +1,6 @@
 services:
   api-0:
-    image: ghcr.io/gabrielrauch/rinha-2026:366b4b00fca00210366422230ed50d3201e67143
+    image: ghcr.io/gabrielrauch/rinha-2026:dba2e7986b6395ef4d9f1eace356f05c325b4a71
     environment:
       - RINHA_THREADS=1
     networks: [rinha]
@@ -11,7 +11,7 @@ services:
           memory: '165M'
     expose: ["8000"]
   api-1:
-    image: ghcr.io/gabrielrauch/rinha-2026:366b4b00fca00210366422230ed50d3201e67143
+    image: ghcr.io/gabrielrauch/rinha-2026:dba2e7986b6395ef4d9f1eace356f05c325b4a71
     environment:
       - RINHA_THREADS=1
     networks: [rinha]
