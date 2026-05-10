@@ -47,7 +47,9 @@ fn run_uds(blob: Arc<server::blob::Blob>, sock_path: PathBuf) -> anyhow::Result<
         .expect("monoio runtime build");
     let sp = sock_path.clone();
     rt.block_on(async move {
-        let opts = ListenerOpts::new();
+        // SO_REUSEADDR on AF_UNIX inside containers can return ENOTSUP — disable it
+        // (and SO_REUSEPORT, which is meaningless for UDS here).
+        let opts = ListenerOpts::new().reuse_addr(false).reuse_port(false);
         let listener = UnixListener::bind_with_config(&sp, &opts)?;
         // HAProxy may connect as a different uid — try to make the socket world-RW.
         let _ = std::fs::set_permissions(&sp, std::fs::Permissions::from_mode(0o666));
