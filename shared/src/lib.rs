@@ -43,11 +43,11 @@ pub struct BlobHeader {
     pub total_blocks: u32,
     pub k_centroids: u32, // NUM_CENTROIDS
 
-    pub centroids_offset: u32,        // f32 SoA, dim-major
-    pub cluster_offsets_offset: u32,  // u32, length k_centroids + 1, block indices
-    pub blocks_offset: u32,           // i16 SoA blocks
-    pub labels_offset: u32,           // bits, length ceil(padded_n / 8)
-    pub mcc_table_offset: u32,        // i8 * 1024
+    pub centroids_offset: u32,       // f32 SoA, dim-major
+    pub cluster_offsets_offset: u32, // u32, length k_centroids + 1, block indices
+    pub blocks_offset: u32,          // i16 SoA blocks
+    pub labels_offset: u32,          // bits, length ceil(padded_n / 8)
+    pub mcc_table_offset: u32,       // i8 * 1024
 
     pub blob_size: u32,
     pub _padding: [u8; 204],
@@ -136,8 +136,8 @@ mod feature_tests {
 pub struct RawFeatures {
     pub amount: f32,
     pub installments: u32,
-    pub hour_of_day: u8,             // 0..=23 UTC
-    pub day_of_week: u8,             // Mon=0..Sun=6
+    pub hour_of_day: u8, // 0..=23 UTC
+    pub day_of_week: u8, // Mon=0..Sun=6
     pub minutes_since_last_tx: Option<f32>,
     pub km_from_last_tx: Option<f32>,
     pub km_from_home: f32,
@@ -146,7 +146,7 @@ pub struct RawFeatures {
     pub is_online: bool,
     pub card_present: bool,
     pub unknown_merchant: bool,
-    pub mcc_risk: f32,               // 0..=1, default 0.5
+    pub mcc_risk: f32, // 0..=1, default 0.5
     pub merchant_avg_amount: f32,
 }
 
@@ -227,8 +227,8 @@ mod vectorize_tests {
         let v = vectorize(&raw);
         assert_eq!(v[5], -127); // sentinel for null minutes
         assert_eq!(v[6], -127); // sentinel for null km
-        assert_eq!(v[9], 0);    // is_online false
+        assert_eq!(v[9], 0); // is_online false
         assert_eq!(v[10], 127); // card_present true
-        assert_eq!(v[11], 0);   // merchant known
+        assert_eq!(v[11], 0); // merchant known
     }
 }

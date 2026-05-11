@@ -1,0 +1,14 @@
+[package]
+name = "lb"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "lb"
+path = "src/main.rs"
+
+[dependencies]
+monoio = { version = "0.2", features = ["iouring", "legacy", "macros"] }
+socket2 = "0.5"
+anyhow = "1"

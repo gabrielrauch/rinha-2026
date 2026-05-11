@@ -47,7 +47,7 @@ pub fn build_blob(inp: &BuildInputs) -> Vec<u8> {
     cluster_offsets.push(0);
     let mut acc: u32 = 0;
     for bucket in &buckets {
-        let n_blocks = (bucket.len() + BLOCK_VECS - 1) / BLOCK_VECS;
+        let n_blocks = bucket.len().div_ceil(BLOCK_VECS);
         acc += n_blocks as u32;
         cluster_offsets.push(acc);
     }
@@ -56,7 +56,7 @@ pub fn build_blob(inp: &BuildInputs) -> Vec<u8> {
 
     // 4. Allocate output buffers.
     let mut out_blocks: Vec<i16> = vec![0i16; total_blocks * VECTOR_DIM * BLOCK_VECS];
-    let mut labels = vec![0u8; (padded_n + 7) / 8];
+    let mut labels = vec![0u8; padded_n.div_ceil(8)];
 
     // 5. Pack each cluster's vectors into SoA blocks.
     for (ci, bucket) in buckets.iter().enumerate() {
@@ -144,7 +144,10 @@ pub fn build_blob(inp: &BuildInputs) -> Vec<u8> {
     };
     out.extend_from_slice(header_bytes);
     let centroids_b = unsafe {
-        std::slice::from_raw_parts(centroids_soa.as_ptr() as *const u8, centroids_bytes as usize)
+        std::slice::from_raw_parts(
+            centroids_soa.as_ptr() as *const u8,
+            centroids_bytes as usize,
+        )
     };
     out.extend_from_slice(centroids_b);
     for &o in &cluster_offsets {

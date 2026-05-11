@@ -9,9 +9,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::blob::Blob;
-use shared::{BLOCK_VECS, NUM_CENTROIDS, VECTOR_DIM};
 #[cfg(target_arch = "x86_64")]
 use shared::QUANT_INV_SCALE;
+use shared::{BLOCK_VECS, NUM_CENTROIDS, VECTOR_DIM};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
@@ -300,8 +300,7 @@ unsafe fn scan_blocks(
         dim_pair!(acc0, acc1, bb, 12);
 
         let acc = _mm256_add_ps(acc0, acc1);
-        let mut mask =
-            _mm256_movemask_ps(_mm256_cmp_ps(acc, threshold, _CMP_LT_OQ)) as u32;
+        let mut mask = _mm256_movemask_ps(_mm256_cmp_ps(acc, threshold, _CMP_LT_OQ)) as u32;
         if mask == 0 {
             continue;
         }

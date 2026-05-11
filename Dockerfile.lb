@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.84-bookworm AS builder
+WORKDIR /work
+COPY Cargo.toml Cargo.lock ./
+
+# Stub crates that lb doesn't depend on so the workspace resolves without
+# copying their real sources. lb depends only on monoio + socket2 + anyhow.
+RUN mkdir -p shared/src builder/src server/src && \
+    printf '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n' > shared/Cargo.toml && \
+    printf '' > shared/src/lib.rs && \
+    printf '[package]\nname = "builder"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n' > builder/Cargo.toml && \
+    printf 'fn main() {}\n' > builder/src/main.rs && \
+    printf '[package]\nname = "server"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n' > server/Cargo.toml && \
+    printf 'fn main() {}\n' > server/src/main.rs
+
+COPY lb ./lb
+ENV RUSTFLAGS="-C target-cpu=haswell"
+RUN cargo build -p lb --release
+
+FROM gcr.io/distroless/cc-debian12 AS runtime
+COPY --from=builder /work/target/release/lb /lb
+ENV PORT=9999 UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock
+EXPOSE 9999
+ENTRYPOINT ["/lb"]

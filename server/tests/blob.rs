@@ -9,5 +9,8 @@ fn loads_smoke_blob() {
     assert_eq!(blob.header().version, shared::VERSION);
     assert!(blob.header().total_vectors > 0);
     assert!(blob.header().k_centroids > 0);
-    assert_eq!(blob.cluster_offsets().len(), blob.header().k_centroids as usize + 1);
+    assert_eq!(
+        blob.cluster_offsets().len(),
+        blob.header().k_centroids as usize + 1
+    );
 }

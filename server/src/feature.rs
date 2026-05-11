@@ -78,7 +78,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = y - if m <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
-    let m_adj: u64 = if m > 2 { (m - 3) as u64 } else { (m + 9) as u64 };
+    let m_adj: u64 = if m > 2 {
+        (m - 3) as u64
+    } else {
+        (m + 9) as u64
+    };
     let doy = (153 * m_adj + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe as i64 - 719468
@@ -137,7 +141,11 @@ mod tests {
         let p = payload::extract(SAMPLE_PRESENT).unwrap();
         let v = vectorize_payload(&blob, &p).unwrap();
         // 120 minutes between timestamps → 120/1440 ≈ 0.0833 → quantized ~10
-        assert!((0.05f32..0.10).contains(&v[5]), "expected ~0.083 in v[5], got {}", v[5]);
+        assert!(
+            (0.05f32..0.10).contains(&v[5]),
+            "expected ~0.083 in v[5], got {}",
+            v[5]
+        );
         assert_ne!(v[6], -1.0);
     }
 

@@ -27,7 +27,10 @@ pub fn extract(body: &[u8]) -> Option<RawPayload<'_>> {
 
     while !s.at_end() {
         s.skip_ws();
-        if s.peek() == Some(b'}') { s.bump(); break; }
+        if s.peek() == Some(b'}') {
+            s.bump();
+            break;
+        }
 
         let key = s.read_string()?;
         s.skip_ws();
@@ -44,7 +47,9 @@ pub fn extract(body: &[u8]) -> Option<RawPayload<'_>> {
         }
 
         s.skip_ws();
-        if s.peek() == Some(b',') { s.bump(); }
+        if s.peek() == Some(b',') {
+            s.bump();
+        }
     }
     Some(p)
 }
@@ -53,9 +58,14 @@ fn parse_transaction<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<
     s.expect(b'{')?;
     loop {
         s.skip_ws();
-        if s.peek() == Some(b'}') { s.bump(); return Some(()); }
+        if s.peek() == Some(b'}') {
+            s.bump();
+            return Some(());
+        }
         let k = s.read_string()?;
-        s.skip_ws(); s.expect(b':')?; s.skip_ws();
+        s.skip_ws();
+        s.expect(b':')?;
+        s.skip_ws();
         match k {
             b"amount" => p.amount = s.read_f32()?,
             b"installments" => p.installments = s.read_u32()?,
@@ -63,7 +73,9 @@ fn parse_transaction<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<
             _ => s.skip_value()?,
         }
         s.skip_ws();
-        if s.peek() == Some(b',') { s.bump(); }
+        if s.peek() == Some(b',') {
+            s.bump();
+        }
     }
 }
 
@@ -71,9 +83,14 @@ fn parse_customer<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<()>
     s.expect(b'{')?;
     loop {
         s.skip_ws();
-        if s.peek() == Some(b'}') { s.bump(); return Some(()); }
+        if s.peek() == Some(b'}') {
+            s.bump();
+            return Some(());
+        }
         let k = s.read_string()?;
-        s.skip_ws(); s.expect(b':')?; s.skip_ws();
+        s.skip_ws();
+        s.expect(b':')?;
+        s.skip_ws();
         match k {
             b"avg_amount" => p.customer_avg_amount = s.read_f32()?,
             b"tx_count_24h" => p.tx_count_24h = s.read_u32()?,
@@ -81,7 +98,9 @@ fn parse_customer<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<()>
             _ => s.skip_value()?,
         }
         s.skip_ws();
-        if s.peek() == Some(b',') { s.bump(); }
+        if s.peek() == Some(b',') {
+            s.bump();
+        }
     }
 }
 
@@ -89,9 +108,14 @@ fn parse_merchant<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<()>
     s.expect(b'{')?;
     loop {
         s.skip_ws();
-        if s.peek() == Some(b'}') { s.bump(); return Some(()); }
+        if s.peek() == Some(b'}') {
+            s.bump();
+            return Some(());
+        }
         let k = s.read_string()?;
-        s.skip_ws(); s.expect(b':')?; s.skip_ws();
+        s.skip_ws();
+        s.expect(b':')?;
+        s.skip_ws();
         match k {
             b"id" => p.merchant_id = s.read_string()?,
             b"mcc" => p.merchant_mcc = s.read_string()?,
@@ -99,7 +123,9 @@ fn parse_merchant<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<()>
             _ => s.skip_value()?,
         }
         s.skip_ws();
-        if s.peek() == Some(b',') { s.bump(); }
+        if s.peek() == Some(b',') {
+            s.bump();
+        }
     }
 }
 
@@ -107,9 +133,14 @@ fn parse_terminal<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<()>
     s.expect(b'{')?;
     loop {
         s.skip_ws();
-        if s.peek() == Some(b'}') { s.bump(); return Some(()); }
+        if s.peek() == Some(b'}') {
+            s.bump();
+            return Some(());
+        }
         let k = s.read_string()?;
-        s.skip_ws(); s.expect(b':')?; s.skip_ws();
+        s.skip_ws();
+        s.expect(b':')?;
+        s.skip_ws();
         match k {
             b"is_online" => p.is_online = s.read_bool()?,
             b"card_present" => p.card_present = s.read_bool()?,
@@ -117,7 +148,9 @@ fn parse_terminal<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Option<()>
             _ => s.skip_value()?,
         }
         s.skip_ws();
-        if s.peek() == Some(b',') { s.bump(); }
+        if s.peek() == Some(b',') {
+            s.bump();
+        }
     }
 }
 
@@ -130,16 +163,23 @@ fn parse_last_transaction<'a>(s: &mut Scanner<'a>, p: &mut RawPayload<'a>) -> Op
     s.expect(b'{')?;
     loop {
         s.skip_ws();
-        if s.peek() == Some(b'}') { s.bump(); break; }
+        if s.peek() == Some(b'}') {
+            s.bump();
+            break;
+        }
         let k = s.read_string()?;
-        s.skip_ws(); s.expect(b':')?; s.skip_ws();
+        s.skip_ws();
+        s.expect(b':')?;
+        s.skip_ws();
         match k {
             b"timestamp" => p.last_timestamp = Some(s.read_string()?),
             b"km_from_current" => p.last_km = Some(s.read_f32()?),
             _ => s.skip_value()?,
         }
         s.skip_ws();
-        if s.peek() == Some(b',') { s.bump(); }
+        if s.peek() == Some(b',') {
+            s.bump();
+        }
     }
     Some(())
 }
@@ -150,18 +190,41 @@ struct Scanner<'a> {
 }
 
 impl<'a> Scanner<'a> {
-    fn new(buf: &'a [u8]) -> Self { Self { buf, i: 0 } }
-    #[inline] fn at_end(&self) -> bool { self.i >= self.buf.len() }
-    #[inline] fn peek(&self) -> Option<u8> { self.buf.get(self.i).copied() }
-    #[inline] fn bump(&mut self) { self.i += 1; }
-    #[inline] fn advance(&mut self, n: usize) { self.i += n; }
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, i: 0 }
+    }
+    #[inline]
+    fn at_end(&self) -> bool {
+        self.i >= self.buf.len()
+    }
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.buf.get(self.i).copied()
+    }
+    #[inline]
+    fn bump(&mut self) {
+        self.i += 1;
+    }
+    #[inline]
+    fn advance(&mut self, n: usize) {
+        self.i += n;
+    }
 
     fn expect(&mut self, c: u8) -> Option<()> {
-        if self.peek()? == c { self.bump(); Some(()) } else { None }
+        if self.peek()? == c {
+            self.bump();
+            Some(())
+        } else {
+            None
+        }
     }
     fn skip_ws(&mut self) {
         while let Some(c) = self.peek() {
-            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' { self.bump(); } else { break; }
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                self.bump();
+            } else {
+                break;
+            }
         }
     }
     fn peek_word(&self, w: &[u8]) -> bool {
@@ -171,8 +234,14 @@ impl<'a> Scanner<'a> {
         self.expect(b'"')?;
         let start = self.i;
         while let Some(c) = self.peek() {
-            if c == b'"' { let s = &self.buf[start..self.i]; self.bump(); return Some(s); }
-            if c == b'\\' { self.bump(); }
+            if c == b'"' {
+                let s = &self.buf[start..self.i];
+                self.bump();
+                return Some(s);
+            }
+            if c == b'\\' {
+                self.bump();
+            }
             self.bump();
         }
         None
@@ -180,7 +249,11 @@ impl<'a> Scanner<'a> {
     fn read_f32(&mut self) -> Option<f32> {
         let start = self.i;
         while let Some(c) = self.peek() {
-            if matches!(c, b'-' | b'+' | b'.' | b'0'..=b'9' | b'e' | b'E') { self.bump(); } else { break; }
+            if matches!(c, b'-' | b'+' | b'.' | b'0'..=b'9' | b'e' | b'E') {
+                self.bump();
+            } else {
+                break;
+            }
         }
         let s = std::str::from_utf8(&self.buf[start..self.i]).ok()?;
         s.parse().ok()
@@ -188,15 +261,25 @@ impl<'a> Scanner<'a> {
     fn read_u32(&mut self) -> Option<u32> {
         let start = self.i;
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() { self.bump(); } else { break; }
+            if c.is_ascii_digit() {
+                self.bump();
+            } else {
+                break;
+            }
         }
         let s = std::str::from_utf8(&self.buf[start..self.i]).ok()?;
         s.parse().ok()
     }
     fn read_bool(&mut self) -> Option<bool> {
-        if self.peek_word(b"true") { self.advance(4); Some(true) }
-        else if self.peek_word(b"false") { self.advance(5); Some(false) }
-        else { None }
+        if self.peek_word(b"true") {
+            self.advance(4);
+            Some(true)
+        } else if self.peek_word(b"false") {
+            self.advance(5);
+            Some(false)
+        } else {
+            None
+        }
     }
     fn read_array_raw(&mut self) -> Option<&'a [u8]> {
         self.expect(b'[')?;
@@ -205,16 +288,35 @@ impl<'a> Scanner<'a> {
         let mut in_str = false;
         while let Some(c) = self.peek() {
             if in_str {
-                if c == b'\\' { self.bump(); }
-                else if c == b'"' { in_str = false; }
+                if c == b'\\' {
+                    self.bump();
+                } else if c == b'"' {
+                    in_str = false;
+                }
                 self.bump();
                 continue;
             }
             match c {
-                b'"' => { in_str = true; self.bump(); }
-                b'[' => { depth += 1; self.bump(); }
-                b']' => { depth -= 1; if depth == 0 { let s = &self.buf[start..self.i]; self.bump(); return Some(s); } self.bump(); }
-                _ => { self.bump(); }
+                b'"' => {
+                    in_str = true;
+                    self.bump();
+                }
+                b'[' => {
+                    depth += 1;
+                    self.bump();
+                }
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let s = &self.buf[start..self.i];
+                        self.bump();
+                        return Some(s);
+                    }
+                    self.bump();
+                }
+                _ => {
+                    self.bump();
+                }
             }
         }
         None
@@ -222,12 +324,31 @@ impl<'a> Scanner<'a> {
     fn skip_value(&mut self) -> Option<()> {
         self.skip_ws();
         match self.peek()? {
-            b'"' => { self.read_string()?; Some(()) }
-            b'{' => { self.skip_object() }
-            b'[' => { self.read_array_raw()?; Some(()) }
-            b't' | b'f' => { self.read_bool()?; Some(()) }
-            b'n' => { if self.peek_word(b"null") { self.advance(4); Some(()) } else { None } }
-            _ => { let _ = self.read_f32()?; Some(()) }
+            b'"' => {
+                self.read_string()?;
+                Some(())
+            }
+            b'{' => self.skip_object(),
+            b'[' => {
+                self.read_array_raw()?;
+                Some(())
+            }
+            b't' | b'f' => {
+                self.read_bool()?;
+                Some(())
+            }
+            b'n' => {
+                if self.peek_word(b"null") {
+                    self.advance(4);
+                    Some(())
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let _ = self.read_f32()?;
+                Some(())
+            }
         }
     }
     fn skip_object(&mut self) -> Option<()> {
@@ -236,16 +357,33 @@ impl<'a> Scanner<'a> {
         let mut in_str = false;
         while let Some(c) = self.peek() {
             if in_str {
-                if c == b'\\' { self.bump(); }
-                else if c == b'"' { in_str = false; }
+                if c == b'\\' {
+                    self.bump();
+                } else if c == b'"' {
+                    in_str = false;
+                }
                 self.bump();
                 continue;
             }
             match c {
-                b'"' => { in_str = true; self.bump(); }
-                b'{' => { depth += 1; self.bump(); }
-                b'}' => { depth -= 1; self.bump(); if depth == 0 { return Some(()); } }
-                _ => { self.bump(); }
+                b'"' => {
+                    in_str = true;
+                    self.bump();
+                }
+                b'{' => {
+                    depth += 1;
+                    self.bump();
+                }
+                b'}' => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        return Some(());
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
             }
         }
         None
