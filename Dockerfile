@@ -13,10 +13,13 @@ COPY builder ./builder
 COPY resources/normalization.json resources/mcc_risk.json resources/example-references.json resources/example-payloads.json ./resources/
 ADD https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz ./resources/references.json.gz
 
-# Stub out the server crate so the workspace is buildable without copying its real source.
-RUN mkdir -p server/src && \
+# Stub out crates the offline-blob step doesn't need so the workspace is
+# buildable without copying their real source.
+RUN mkdir -p server/src lb/src && \
     printf '[package]\nname = "server"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n[dependencies]\n' > server/Cargo.toml && \
-    printf 'fn main() {}\n' > server/src/main.rs
+    printf 'fn main() {}\n' > server/src/main.rs && \
+    printf '[package]\nname = "lb"\nversion = "0.1.0"\nedition = "2021"\npublish = false\n' > lb/Cargo.toml && \
+    printf 'fn main() {}\n' > lb/src/main.rs
 
 RUN mkdir -p /out && cargo run -p builder --release -- ./resources /out/blob.bin
 
