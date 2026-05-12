@@ -1,9 +1,13 @@
 //! IVF search with AVX2+FMA SoA scan. Same compute kernel as jairoblatt's
 //! reference, with our additions:
-//! - K=16384 centroids (~183 vec/cluster, finer recall resolution)
+//! - K=8192 centroids (smaller clusters, less per-probe scan)
 //! - Cluster ordering: vectors closest to centroid come first so early
 //!   termination kicks in sooner
-//! - 3-tier adaptive: nprobe=8 / 24 / 64 (scaled with K to keep coverage)
+//! - 3-tier adaptive: nprobe=4 / 12 / 32
+//! - Distance-weighted vote: instead of plain "count of fraud in top-5",
+//!   weight each neighbor by 1/(dist+eps) and round (fraud_weight/total_weight)*5.
+//!   Closer neighbors influence the call more — same as KNN with weighted
+//!   distance, and shifts borderline counts toward whichever side is closer.
 
 #![allow(clippy::needless_range_loop)]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -17,9 +21,9 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 use std::mem::MaybeUninit;
 
-pub const NPROBE_FAST: usize = 8;
-pub const NPROBE_MID: usize = 24;
-pub const NPROBE_DEEP: usize = 64;
+pub const NPROBE_FAST: usize = 4;
+pub const NPROBE_MID: usize = 12;
+pub const NPROBE_DEEP: usize = 32;
 pub const MAX_CENTROIDS: usize = NUM_CENTROIDS as usize;
 pub const TOP_K: usize = 5;
 /// Block byte stride: 14 dims × 8 vecs × i16 = 112 i16.
@@ -229,7 +233,22 @@ unsafe fn scan_and_count(probes: &[usize], blob: &Blob, q_vecs: &[__m256; VECTOR
         );
     }
 
-    top.iter().filter(|(_, l)| *l == 1).count() as u8
+    // Distance-weighted vote: weight each top-5 neighbor by 1/(dist+eps).
+    // Same answer as plain count for evenly-spaced neighbors; for uneven
+    // distributions it pulls the call toward whichever side is closer.
+    // round((fraud_weight / total_weight) * 5) → still 0..=5.
+    let eps = 1e-6_f32;
+    let mut total_w = 0.0_f32;
+    let mut fraud_w = 0.0_f32;
+    for &(d, label) in top.iter() {
+        let w = 1.0 / (d + eps);
+        total_w += w;
+        if label == 1 {
+            fraud_w += w;
+        }
+    }
+    let frac = if total_w > 0.0 { fraud_w / total_w } else { 0.0 };
+    (frac * (TOP_K as f32)).round() as u8
 }
 
 #[cfg(target_arch = "x86_64")]
