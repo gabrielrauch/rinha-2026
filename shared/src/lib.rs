@@ -23,7 +23,7 @@ pub const VECTOR_DIM: usize = 14;
 pub const MCC_TABLE_SIZE: usize = 1024;
 
 /// IVF parameters
-pub const NUM_CENTROIDS: u32 = 8192;
+pub const NUM_CENTROIDS: u32 = 16384;
 pub const BLOCK_VECS: usize = 8;
 pub const BLOCK_BYTES: usize = BLOCK_VECS * VECTOR_DIM * 2; // 8 vecs * 14 dims * i16 = 224 bytes
 /// Quantization scale. Vectors are clamped to [-1, 1] then multiplied by SCALE

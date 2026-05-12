@@ -1,9 +1,9 @@
 //! IVF search with AVX2+FMA SoA scan. Same compute kernel as jairoblatt's
 //! reference, with our additions:
-//! - K=8192 centroids (smaller clusters, less per-probe scan)
+//! - K=16384 centroids (~183 vec/cluster, finer recall resolution)
 //! - Cluster ordering: vectors closest to centroid come first so early
 //!   termination kicks in sooner
-//! - 3-tier adaptive: nprobe=4 / 12 / 32
+//! - 3-tier adaptive: nprobe=8 / 24 / 64 (scaled with K to keep coverage)
 
 #![allow(clippy::needless_range_loop)]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -17,9 +17,9 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 use std::mem::MaybeUninit;
 
-pub const NPROBE_FAST: usize = 4;
-pub const NPROBE_MID: usize = 12;
-pub const NPROBE_DEEP: usize = 32;
+pub const NPROBE_FAST: usize = 8;
+pub const NPROBE_MID: usize = 24;
+pub const NPROBE_DEEP: usize = 64;
 pub const MAX_CENTROIDS: usize = NUM_CENTROIDS as usize;
 pub const TOP_K: usize = 5;
 /// Block byte stride: 14 dims × 8 vecs × i16 = 112 i16.
