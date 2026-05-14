@@ -4,6 +4,11 @@ use shared::{BlobHeader, BLOCK_VECS, MAGIC, MCC_TABLE_SIZE, VECTOR_DIM, VERSION}
 use std::fs::File;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+const MADV_HUGEPAGE: libc::c_int = 14;
+#[cfg(target_os = "linux")]
+const MADV_RANDOM: libc::c_int = 1;
+
 pub struct Blob {
     _mmap: Mmap,
     base: *const u8,
@@ -43,9 +48,26 @@ impl Blob {
             base,
             len,
         };
+        blob.advise();
         blob.prefetch();
         Ok(blob)
     }
+
+    /// Hint the kernel about expected access pattern. Best-effort: failure is silent.
+    /// - HUGEPAGE: the blob is 80MB+ and we touch it on every request, so 2MB
+    ///   transparent huge pages cut TLB pressure from thousands of entries to
+    ///   ~40 — saves the deep-tier scan a chunk of TLB-miss cycles at p99.
+    /// - RANDOM: per-request we jump to a handful of clusters scattered across
+    ///   the file; the default readahead is wasted bandwidth in this pattern.
+    #[cfg(target_os = "linux")]
+    fn advise(&self) {
+        unsafe {
+            libc::madvise(self.base as *mut _, self.len, MADV_HUGEPAGE);
+            libc::madvise(self.base as *mut _, self.len, MADV_RANDOM);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn advise(&self) {}
 
     /// Walk every page once to populate the kernel's page cache.
     fn prefetch(&self) {
