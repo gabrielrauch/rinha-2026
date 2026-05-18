@@ -1,177 +1,322 @@
-//! Build the IVF SoA blob. Layout v3:
-//!  - header
-//!  - centroids: f32 SoA, dim-major (dim 0 of all K, then dim 1, ...)
-//!  - cluster_offsets: u32, K+1 entries, indexed by cluster id → starting block index
-//!  - blocks: i16 SoA, each block is 14 dims × 8 vecs (dim 0 slot 0..7, dim 1 slot 0..7, ...)
-//!  - labels: 1 bit per (block_idx*8 + slot_idx), 1 = fraud, padding slots = 0
-//!  - mcc table: 1024 × i8
+//! KD-tree partitioned blob builder. Mirrors MXLange's `build_index.c` so the
+//! on-disk format is byte-compatible with their runtime layout.
+//!
+//! Algorithm:
+//! 1. Bucket every reference by `partition_key`. A few dozen buckets typically
+//!    emerge (8 bits → 256 max, but most combinations don't exist in the data).
+//! 2. Within each bucket, recursively split on the widest dim at the median.
+//!    Stop when len ≤ LEAF_SIZE; emit a leaf node pointing into the global
+//!    blocks vector. Each non-leaf node spans `left.len + right.len` blocks
+//!    so its bbox is the join of its children.
+//! 3. After all trees are built, pack the leaf vectors into block-grouped
+//!    SoA: per block, dim 0 of all 8 lanes contiguous, then dim 1, etc.
+//! 4. Serialize header + partitions + nodes + vectors + labels.
 
-use crate::quantize::quantize_dim;
-use shared::*;
-use std::collections::HashMap;
+use shared::{
+    partition_key, BlobHeader, QueryVector, BLOCK_BYTES, HEADER_SIZE, LANES, MAGIC, MCC_TABLE_SIZE,
+    NODE_SIZE, PACKED_DIMS, PART_SIZE, QUANT_SCALE, VECTOR_DIM, VERSION,
+};
+
+pub const DEFAULT_LEAF_SIZE: usize = 128;
 
 pub struct BuildInputs<'a> {
-    pub centroids: &'a [[f32; VECTOR_DIM]],
-    pub assignments: &'a [u32],
-    pub vectors_f32: &'a [[f32; VECTOR_DIM]],
-    pub is_fraud: &'a [bool],
-    pub mcc_risk: &'a HashMap<u32, f32>,
+    pub vectors: &'a [QueryVector],
+    pub labels: &'a [u8],
+    /// MCC → risk i16 table (`MCC_TABLE_SIZE` entries). Server looks this up
+    /// per query at runtime so build/query agree on partition_key.
+    pub mcc_table: &'a [i16; MCC_TABLE_SIZE],
 }
 
-pub fn build_blob(inp: &BuildInputs) -> Vec<u8> {
-    let n = inp.vectors_f32.len();
-    let k = inp.centroids.len();
-    assert_eq!(inp.assignments.len(), n);
-    assert_eq!(inp.is_fraud.len(), n);
+#[derive(Clone, Copy)]
+struct BuildNode {
+    left: i32,
+    right: i32,
+    start: i32, // index into `blocks` in *Reference units* (not block units yet)
+    len: i32,
+    min: QueryVector,
+    max: QueryVector,
+}
 
-    // 1. Group vector indices by cluster.
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); k];
-    for (i, &a) in inp.assignments.iter().enumerate() {
-        buckets[a as usize].push(i as u32);
+#[derive(Clone, Copy)]
+struct PartitionRoot {
+    key: u32,
+    root: i32,
+}
+
+pub fn build_blob(input: &BuildInputs) -> Vec<u8> {
+    build_blob_with_leaf(input, DEFAULT_LEAF_SIZE)
+}
+
+pub fn build_blob_with_leaf(input: &BuildInputs, leaf_size: usize) -> Vec<u8> {
+    assert_eq!(
+        input.vectors.len(),
+        input.labels.len(),
+        "vectors and labels length mismatch"
+    );
+    let leaf_size = leaf_size.clamp(32, 2048);
+
+    // 1. Bucket by partition_key.
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); 256];
+    for (i, v) in input.vectors.iter().enumerate() {
+        let key = partition_key(v) as usize;
+        buckets[key].push(i);
     }
 
-    // 2. Within each cluster, sort by distance to centroid ascending.
-    //    Vectors closest to centroid (most "typical") come first → early termination
-    //    in the search scan filters more aggressively on far candidates.
-    for (ci, bucket) in buckets.iter_mut().enumerate() {
-        let centroid = &inp.centroids[ci];
-        bucket.sort_unstable_by(|&a, &b| {
-            let da = dist_sq_f32(&inp.vectors_f32[a as usize], centroid);
-            let db = dist_sq_f32(&inp.vectors_f32[b as usize], centroid);
-            da.total_cmp(&db)
+    // 2. Build trees. `blocks` holds (vector, label) per slot in leaf-emission
+    // order. `nodes` is the global node array. `roots` records which node is
+    // the root of each non-empty partition.
+    let mut nodes: Vec<BuildNode> = Vec::new();
+    let mut blocks: Vec<(QueryVector, u8)> = Vec::with_capacity(input.vectors.len() + LANES);
+    let mut roots: Vec<PartitionRoot> = Vec::new();
+
+    for (key, indices) in buckets.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let root = build_tree(
+            input.vectors,
+            input.labels,
+            indices,
+            leaf_size,
+            &mut blocks,
+            &mut nodes,
+        );
+        roots.push(PartitionRoot {
+            key: key as u32,
+            root: root as i32,
         });
     }
 
-    // 3. Compute cluster_offsets: each cluster occupies ceil(size / BLOCK_VECS) blocks.
-    let mut cluster_offsets: Vec<u32> = Vec::with_capacity(k + 1);
-    cluster_offsets.push(0);
-    let mut acc: u32 = 0;
-    for bucket in &buckets {
-        let n_blocks = bucket.len().div_ceil(BLOCK_VECS);
-        acc += n_blocks as u32;
-        cluster_offsets.push(acc);
+    // Sanity: blocks emitted must be a multiple of LANES (we padded each leaf).
+    assert_eq!(blocks.len() % LANES, 0, "block padding broken");
+    let block_count = blocks.len() / LANES;
+
+    // 3. Serialize.
+    let parts_off = HEADER_SIZE;
+    let nodes_off = parts_off + roots.len() * PART_SIZE;
+    let vectors_off = nodes_off + nodes.len() * NODE_SIZE;
+    let labels_off = vectors_off + block_count * BLOCK_BYTES;
+    let mcc_table_off = labels_off + block_count * LANES;
+    let total = mcc_table_off + MCC_TABLE_SIZE * 2;
+    let mut out = vec![0u8; total];
+
+    // Header
+    {
+        let h = BlobHeader {
+            magic: MAGIC,
+            scale: QUANT_SCALE as u32,
+            dims: VECTOR_DIM as u32,
+            packed_dims: PACKED_DIMS as u32,
+            lanes: LANES as u32,
+            ref_count: input.vectors.len() as u32,
+            part_count: roots.len() as u32,
+            node_count: nodes.len() as u32,
+            block_count: block_count as u32,
+            mcc_table_offset: mcc_table_off as u32,
+            _padding: [0u8; 20],
+        };
+        let _ = h.scale; // version is implicit in MAGIC for this format
+        let _ = VERSION;
+        let bytes: [u8; HEADER_SIZE] = unsafe { std::mem::transmute(h) };
+        out[..HEADER_SIZE].copy_from_slice(&bytes);
     }
-    let total_blocks = acc as usize;
-    let padded_n = total_blocks * BLOCK_VECS;
 
-    // 4. Allocate output buffers.
-    let mut out_blocks: Vec<i16> = vec![0i16; total_blocks * VECTOR_DIM * BLOCK_VECS];
-    let mut labels = vec![0u8; padded_n.div_ceil(8)];
+    // Partitions: key u32, root i32, length i32, min[16], max[16]
+    for (i, r) in roots.iter().enumerate() {
+        let off = parts_off + i * PART_SIZE;
+        let n = &nodes[r.root as usize];
+        out[off..off + 4].copy_from_slice(&r.key.to_le_bytes());
+        out[off + 4..off + 8].copy_from_slice(&r.root.to_le_bytes());
+        out[off + 8..off + 12].copy_from_slice(&n.len.to_le_bytes());
+        write_vec16(&mut out[off + 12..off + 44], &n.min);
+        write_vec16(&mut out[off + 44..off + 76], &n.max);
+    }
 
-    // 5. Pack each cluster's vectors into SoA blocks.
-    for (ci, bucket) in buckets.iter().enumerate() {
-        let block_start = cluster_offsets[ci] as usize;
-        for (slot_global, &vi) in bucket.iter().enumerate() {
-            let block_offset = block_start + slot_global / BLOCK_VECS;
-            let slot = slot_global % BLOCK_VECS;
-            let base = block_offset * VECTOR_DIM * BLOCK_VECS;
-            let v = &inp.vectors_f32[vi as usize];
-            for d in 0..VECTOR_DIM {
-                out_blocks[base + d * BLOCK_VECS + slot] = quantize_dim(v[d]);
-            }
-            if inp.is_fraud[vi as usize] {
-                let bit = block_offset * BLOCK_VECS + slot;
-                labels[bit / 8] |= 1 << (bit % 8);
+    // Nodes
+    for (i, n) in nodes.iter().enumerate() {
+        let off = nodes_off + i * NODE_SIZE;
+        out[off..off + 4].copy_from_slice(&n.left.to_le_bytes());
+        out[off + 4..off + 8].copy_from_slice(&n.right.to_le_bytes());
+        // `start` in BuildNode is in slot units; convert to block index here.
+        // (MXLange does the same conversion at write time.)
+        let start_block = if n.left < 0 {
+            n.start / LANES as i32
+        } else {
+            n.start
+        };
+        out[off + 8..off + 12].copy_from_slice(&start_block.to_le_bytes());
+        out[off + 12..off + 16].copy_from_slice(&n.len.to_le_bytes());
+        write_vec16(&mut out[off + 16..off + 48], &n.min);
+        write_vec16(&mut out[off + 48..off + 80], &n.max);
+    }
+
+    // Vectors: per block, dim 0 of LANES lanes, dim 1 of LANES lanes, ..., dim 13.
+    for b in 0..block_count {
+        let block_off = vectors_off + b * BLOCK_BYTES;
+        for d in 0..VECTOR_DIM {
+            let dim_off = block_off + d * LANES * 2;
+            for lane in 0..LANES {
+                let slot = b * LANES + lane;
+                let val = blocks[slot].0[d];
+                out[dim_off + lane * 2..dim_off + lane * 2 + 2].copy_from_slice(&val.to_le_bytes());
             }
         }
-        // Pad unused slots with i16::MAX so their distance computes to "infinity".
-        let used = bucket.len();
-        let last_block_used = used % BLOCK_VECS;
-        if last_block_used != 0 && !bucket.is_empty() {
-            let block_offset = block_start + used / BLOCK_VECS;
-            let base = block_offset * VECTOR_DIM * BLOCK_VECS;
-            for slot in last_block_used..BLOCK_VECS {
-                for d in 0..VECTOR_DIM {
-                    out_blocks[base + d * BLOCK_VECS + slot] = i16::MAX;
-                }
-            }
+    }
+
+    // Labels: 1 byte per slot
+    for b in 0..block_count {
+        let base = labels_off + b * LANES;
+        for lane in 0..LANES {
+            out[base + lane] = blocks[b * LANES + lane].1;
         }
     }
 
-    // 6. Centroides as f32 dim-major SoA.
-    let mut centroids_soa: Vec<f32> = Vec::with_capacity(VECTOR_DIM * k);
-    for d in 0..VECTOR_DIM {
-        for ci in 0..k {
-            centroids_soa.push(inp.centroids[ci][d]);
-        }
+    // MCC risk table: MCC_TABLE_SIZE × i16 little-endian
+    for (i, &v) in input.mcc_table.iter().enumerate() {
+        let off = mcc_table_off + i * 2;
+        out[off..off + 2].copy_from_slice(&v.to_le_bytes());
     }
 
-    // 7. MCC table (i8, scale -127..127).
-    let mut mcc_table = [(0.5f32 * 127.0).round() as i8; MCC_TABLE_SIZE];
-    for (&mcc, &risk) in inp.mcc_risk {
-        let q = (risk.clamp(0.0, 1.0) * 127.0).round() as i8;
-        mcc_table[(mcc as usize) % MCC_TABLE_SIZE] = q;
-    }
-
-    // 8. Layout offsets.
-    let header_size = std::mem::size_of::<BlobHeader>() as u32;
-    let centroids_bytes = (VECTOR_DIM * k * 4) as u32;
-    let cluster_offsets_bytes = ((k + 1) * 4) as u32;
-    let blocks_bytes = (total_blocks * VECTOR_DIM * BLOCK_VECS * 2) as u32;
-    let labels_bytes = ((padded_n + 7) / 8) as u32;
-    let mcc_bytes = MCC_TABLE_SIZE as u32;
-
-    let centroids_offset = header_size;
-    let cluster_offsets_offset = centroids_offset + centroids_bytes;
-    let blocks_offset = cluster_offsets_offset + cluster_offsets_bytes;
-    let labels_offset = blocks_offset + blocks_bytes;
-    let mcc_table_offset = labels_offset + labels_bytes;
-    let blob_size = mcc_table_offset + mcc_bytes;
-
-    let header = BlobHeader {
-        magic: MAGIC,
-        version: VERSION,
-        total_vectors: n as u32,
-        padded_n: padded_n as u32,
-        total_blocks: total_blocks as u32,
-        k_centroids: k as u32,
-        centroids_offset,
-        cluster_offsets_offset,
-        blocks_offset,
-        labels_offset,
-        mcc_table_offset,
-        blob_size,
-        _padding: [0; 204],
-    };
-
-    // 9. Write out.
-    let mut out = Vec::with_capacity(blob_size as usize);
-    let header_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &header as *const BlobHeader as *const u8,
-            std::mem::size_of::<BlobHeader>(),
-        )
-    };
-    out.extend_from_slice(header_bytes);
-    let centroids_b = unsafe {
-        std::slice::from_raw_parts(
-            centroids_soa.as_ptr() as *const u8,
-            centroids_bytes as usize,
-        )
-    };
-    out.extend_from_slice(centroids_b);
-    for &o in &cluster_offsets {
-        out.extend_from_slice(&o.to_le_bytes());
-    }
-    let blocks_b = unsafe {
-        std::slice::from_raw_parts(out_blocks.as_ptr() as *const u8, blocks_bytes as usize)
-    };
-    out.extend_from_slice(blocks_b);
-    out.extend_from_slice(&labels);
-    let mcc_b =
-        unsafe { std::slice::from_raw_parts(mcc_table.as_ptr() as *const u8, MCC_TABLE_SIZE) };
-    out.extend_from_slice(mcc_b);
-
-    debug_assert_eq!(out.len(), blob_size as usize, "blob size mismatch");
     out
 }
 
-#[inline]
-fn dist_sq_f32(a: &[f32; VECTOR_DIM], b: &[f32; VECTOR_DIM]) -> f32 {
-    let mut s = 0.0f32;
-    for i in 0..VECTOR_DIM {
-        let d = a[i] - b[i];
-        s += d * d;
+fn write_vec16(dst: &mut [u8], v: &QueryVector) {
+    debug_assert_eq!(dst.len(), 32);
+    for i in 0..PACKED_DIMS {
+        dst[i * 2..i * 2 + 2].copy_from_slice(&v[i].to_le_bytes());
     }
-    s
+}
+
+fn bounds(vectors: &[QueryVector], indices: &[usize]) -> (QueryVector, QueryVector) {
+    let mut lo: QueryVector = [i16::MAX; PACKED_DIMS];
+    let mut hi: QueryVector = [i16::MIN; PACKED_DIMS];
+    for &i in indices {
+        let v = &vectors[i];
+        for d in 0..PACKED_DIMS {
+            if v[d] < lo[d] {
+                lo[d] = v[d];
+            }
+            if v[d] > hi[d] {
+                hi[d] = v[d];
+            }
+        }
+    }
+    (lo, hi)
+}
+
+fn widest_dim(lo: &QueryVector, hi: &QueryVector) -> usize {
+    let mut best = 0;
+    let mut best_w = i32::MIN;
+    for d in 0..VECTOR_DIM {
+        let w = hi[d] as i32 - lo[d] as i32;
+        if w > best_w {
+            best_w = w;
+            best = d;
+        }
+    }
+    best
+}
+
+fn build_tree(
+    vectors: &[QueryVector],
+    labels: &[u8],
+    indices: &[usize],
+    leaf_size: usize,
+    blocks: &mut Vec<(QueryVector, u8)>,
+    nodes: &mut Vec<BuildNode>,
+) -> usize {
+    let (lo, hi) = bounds(vectors, indices);
+
+    let node_idx = nodes.len();
+    nodes.push(BuildNode {
+        left: -1,
+        right: -1,
+        start: 0,
+        len: indices.len() as i32,
+        min: lo,
+        max: hi,
+    });
+
+    if indices.len() <= leaf_size {
+        // Emit leaf: append vectors padded up to a multiple of LANES.
+        let start_slot = blocks.len() as i32;
+        for &i in indices {
+            blocks.push((vectors[i], labels[i]));
+        }
+        // Pad to LANES boundary with zero (label=0). These dummy vectors have
+        // huge distance (or 0?) — actually they have ZERO distance so they'd
+        // win the top-5. We need to flag them so they don't get selected.
+        // MXLange uses zero-padded vectors too; their distance scoring works
+        // because real vectors with sentinel -SCALE in dim 5/6 are far from
+        // (0, 0, ..., 0). But pad slots have label=0 and distance 0 → wrong.
+        //
+        // Fix: pad with i16::MAX in all dims so distance is enormous.
+        while blocks.len() % LANES != 0 {
+            blocks.push(([i16::MAX; PACKED_DIMS], 0));
+        }
+        let node = &mut nodes[node_idx];
+        node.left = -1;
+        node.right = -1;
+        node.start = start_slot;
+        node.len = indices.len() as i32;
+        return node_idx;
+    }
+
+    let split_dim = widest_dim(&lo, &hi);
+    let mut sorted = indices.to_vec();
+    sorted.sort_unstable_by_key(|&i| vectors[i][split_dim]);
+    let mid = sorted.len() / 2;
+    let (left_idx, right_idx) = sorted.split_at(mid);
+
+    let left = build_tree(vectors, labels, left_idx, leaf_size, blocks, nodes);
+    let right = build_tree(vectors, labels, right_idx, leaf_size, blocks, nodes);
+
+    let left_start = nodes[left].start;
+    let total_len = nodes[left].len + nodes[right].len;
+    let node = &mut nodes[node_idx];
+    node.left = left as i32;
+    node.right = right as i32;
+    node.start = left_start;
+    node.len = total_len;
+    node_idx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_vec(seed: i16) -> QueryVector {
+        let mut v: QueryVector = [0; PACKED_DIMS];
+        for d in 0..VECTOR_DIM {
+            v[d] = seed.wrapping_mul((d as i16) + 1).wrapping_add(d as i16);
+        }
+        v
+    }
+
+    #[test]
+    fn build_small_blob_round_trip() {
+        let mut vectors = Vec::new();
+        let mut labels = Vec::new();
+        for i in 0..600 {
+            vectors.push(mk_vec(i as i16));
+            labels.push((i % 5 == 0) as u8);
+        }
+        let mcc_table = [0i16; MCC_TABLE_SIZE];
+        let bytes = build_blob_with_leaf(
+            &BuildInputs {
+                vectors: &vectors,
+                labels: &labels,
+                mcc_table: &mcc_table,
+            },
+            64,
+        );
+        assert!(bytes.len() > HEADER_SIZE);
+        // Header sanity
+        assert_eq!(&bytes[..8], &MAGIC);
+        // dims/scale/packed_dims/lanes are at fixed offsets
+        let scale = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(scale, QUANT_SCALE as u32);
+        let dims = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(dims, VECTOR_DIM as u32);
+    }
 }

@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use memmap2::Mmap;
-use shared::{BlobHeader, BLOCK_VECS, MAGIC, MCC_TABLE_SIZE, VECTOR_DIM, VERSION};
+use shared::{
+    BlobHeader, BLOCK_BYTES, HEADER_SIZE, LANES, MAGIC, MCC_TABLE_SIZE, NODE_SIZE, PACKED_DIMS,
+    PART_SIZE, QUANT_SCALE, VECTOR_DIM,
+};
 use std::fs::File;
 use std::path::Path;
 
@@ -8,12 +11,22 @@ use std::path::Path;
 const MADV_HUGEPAGE: libc::c_int = 14;
 #[cfg(target_os = "linux")]
 const MADV_RANDOM: libc::c_int = 1;
+#[cfg(target_os = "linux")]
+const MADV_WILLNEED: libc::c_int = 3;
 
 pub struct Blob {
     _mmap: Mmap,
     base: *const u8,
-    #[allow(dead_code)]
     len: usize,
+    partitions_off: usize,
+    nodes_off: usize,
+    vectors_off: usize,
+    labels_off: usize,
+    mcc_table_off: usize,
+    part_count: u32,
+    node_count: u32,
+    block_count: u32,
+    part_by_key: [i32; 256],
 }
 
 unsafe impl Send for Blob {}
@@ -26,50 +39,94 @@ impl Blob {
         let base = mmap.as_ptr();
         let len = mmap.len();
 
-        if len < std::mem::size_of::<BlobHeader>() {
+        if len < HEADER_SIZE {
             return Err(anyhow!("blob too small"));
         }
         let header: &BlobHeader = unsafe { &*(base as *const BlobHeader) };
         if header.magic != MAGIC {
-            return Err(anyhow!("bad magic"));
+            return Err(anyhow!("bad magic {:?}", header.magic));
         }
-        if header.version != VERSION {
-            return Err(anyhow!("unsupported blob version {}", header.version));
+        if header.scale != QUANT_SCALE as u32 {
+            return Err(anyhow!("scale mismatch (got {})", header.scale));
         }
-        if header.blob_size as usize != len {
+        if header.dims as usize != VECTOR_DIM
+            || header.packed_dims as usize != PACKED_DIMS
+            || header.lanes as usize != LANES
+        {
+            return Err(anyhow!("dim/lane mismatch"));
+        }
+
+        let part_count = header.part_count;
+        let node_count = header.node_count;
+        let block_count = header.block_count;
+
+        let partitions_off = HEADER_SIZE;
+        let nodes_off = partitions_off + part_count as usize * PART_SIZE;
+        let vectors_off = nodes_off + node_count as usize * NODE_SIZE;
+        let labels_off = vectors_off + block_count as usize * BLOCK_BYTES;
+        let mcc_table_off = labels_off + block_count as usize * LANES;
+        let end = mcc_table_off + MCC_TABLE_SIZE * 2;
+        if end != len {
             return Err(anyhow!(
-                "blob size mismatch (header {} vs file {})",
-                header.blob_size,
+                "blob size mismatch (computed {}, file {})",
+                end,
                 len
             ));
         }
+        if header.mcc_table_offset as usize != mcc_table_off {
+            return Err(anyhow!(
+                "mcc table offset mismatch (header {}, computed {})",
+                header.mcc_table_offset,
+                mcc_table_off
+            ));
+        }
+
+        // Per-key partition lookup table for O(1) primary-partition select.
+        let mut part_by_key = [-1i32; 256];
+        for i in 0..part_count as usize {
+            let off = partitions_off + i * PART_SIZE;
+            let key = u32::from_le_bytes(unsafe { *(base.add(off) as *const [u8; 4]) });
+            if (key as usize) < 256 {
+                part_by_key[key as usize] = i as i32;
+            }
+        }
+
         let blob = Self {
             _mmap: mmap,
             base,
             len,
+            partitions_off,
+            nodes_off,
+            vectors_off,
+            labels_off,
+            mcc_table_off,
+            part_count,
+            node_count,
+            block_count,
+            part_by_key,
         };
         blob.advise();
         blob.prefetch();
         Ok(blob)
     }
 
-    /// Hint the kernel about expected access pattern. Best-effort: failure is silent.
-    /// - HUGEPAGE: the blob is 80MB+ and we touch it on every request, so 2MB
-    ///   transparent huge pages cut TLB pressure from thousands of entries to
-    ///   ~40 — saves the deep-tier scan a chunk of TLB-miss cycles at p99.
-    /// - RANDOM: per-request we jump to a handful of clusters scattered across
-    ///   the file; the default readahead is wasted bandwidth in this pattern.
     #[cfg(target_os = "linux")]
     fn advise(&self) {
         unsafe {
             libc::madvise(self.base as *mut _, self.len, MADV_HUGEPAGE);
-            libc::madvise(self.base as *mut _, self.len, MADV_RANDOM);
+            // The hot region we re-touch every request is just the vectors +
+            // labels; mark it WILLNEED so the kernel keeps it resident. The
+            // partitions/nodes are tiny and don't need explicit advice.
+            let hot_start = self.vectors_off;
+            let hot_len = self.len - hot_start;
+            libc::madvise(self.base.add(hot_start) as *mut _, hot_len, MADV_HUGEPAGE);
+            libc::madvise(self.base.add(hot_start) as *mut _, hot_len, MADV_RANDOM);
+            libc::madvise(self.base.add(hot_start) as *mut _, hot_len, MADV_WILLNEED);
         }
     }
     #[cfg(not(target_os = "linux"))]
     fn advise(&self) {}
 
-    /// Walk every page once to populate the kernel's page cache.
     fn prefetch(&self) {
         const PAGE: usize = 4096;
         let mut acc: u8 = 0;
@@ -89,58 +146,61 @@ impl Blob {
     }
 
     #[inline]
-    pub fn header(&self) -> &BlobHeader {
-        unsafe { &*(self.base as *const BlobHeader) }
+    pub fn part_count(&self) -> u32 {
+        self.part_count
     }
 
-    /// Pointer to centroids region (f32 SoA dim-major, K * VECTOR_DIM floats).
     #[inline]
-    pub fn centroids_ptr(&self) -> *const f32 {
-        let h = self.header();
-        unsafe { self.base.add(h.centroids_offset as usize) as *const f32 }
+    pub fn node_count(&self) -> u32 {
+        self.node_count
     }
 
-    /// `cluster_offsets[i]..cluster_offsets[i+1]` is the half-open range of
-    /// block indices belonging to cluster i.
     #[inline]
-    pub fn cluster_offsets(&self) -> &[u32] {
-        let h = self.header();
-        let n = h.k_centroids as usize + 1;
-        let p = unsafe { self.base.add(h.cluster_offsets_offset as usize) };
-        unsafe { std::slice::from_raw_parts(p as *const u32, n) }
+    pub fn block_count(&self) -> u32 {
+        self.block_count
     }
 
-    /// Pointer to the start of the blocks region (i16 SoA).
     #[inline]
-    pub fn blocks_ptr(&self) -> *const i16 {
-        let h = self.header();
-        unsafe { self.base.add(h.blocks_offset as usize) as *const i16 }
+    pub fn part_by_key(&self, key: u32) -> i32 {
+        self.part_by_key[(key & 0xff) as usize]
     }
 
+    /// Pointer to the start of the partitions table. Each entry is `PART_SIZE`
+    /// bytes: key u32, root i32, length i32, min[16] i16, max[16] i16.
+    #[inline]
+    pub fn partitions_ptr(&self) -> *const u8 {
+        unsafe { self.base.add(self.partitions_off) }
+    }
+
+    /// Pointer to the start of the nodes table. Each entry is `NODE_SIZE`:
+    /// left i32, right i32, start i32, len i32, min[16] i16, max[16] i16.
+    #[inline]
+    pub fn nodes_ptr(&self) -> *const u8 {
+        unsafe { self.base.add(self.nodes_off) }
+    }
+
+    /// Pointer to the start of the vectors region (i16 SoA, per-block layout).
+    /// Stride within a block: dim 0 lanes 0..7 (16 bytes), dim 1 lanes 0..7, etc.
+    #[inline]
+    pub fn vectors_ptr(&self) -> *const i16 {
+        unsafe { self.base.add(self.vectors_off) as *const i16 }
+    }
+
+    /// Pointer to the start of labels (1 byte per slot, `block_count * LANES`
+    /// bytes total).
     #[inline]
     pub fn labels_ptr(&self) -> *const u8 {
-        let h = self.header();
-        unsafe { self.base.add(h.labels_offset as usize) }
+        unsafe { self.base.add(self.labels_off) }
     }
 
-    /// Whether the vector at slot `slot` of block `block_idx` is labeled fraud.
+    /// Look up the i16-scaled MCC risk for an MCC code. Hash by `mcc %
+    /// MCC_TABLE_SIZE` to match the builder's index choice.
     #[inline]
-    pub fn is_fraud_slot(&self, block_idx: u32, slot: u32) -> bool {
-        let bit = block_idx as usize * BLOCK_VECS + slot as usize;
-        let byte = unsafe { *self.labels_ptr().add(bit / 8) };
-        (byte >> (bit % 8)) & 1 == 1
-    }
-
-    #[inline]
-    pub fn mcc_risk(&self, mcc: u32) -> i8 {
-        let h = self.header();
-        let p = unsafe { self.base.add(h.mcc_table_offset as usize) };
-        let table = unsafe { std::slice::from_raw_parts(p as *const i8, MCC_TABLE_SIZE) };
-        table[(mcc as usize) % MCC_TABLE_SIZE]
-    }
-
-    #[inline]
-    pub fn vector_dim(&self) -> usize {
-        VECTOR_DIM
+    pub fn mcc_risk(&self, mcc: u32) -> i16 {
+        let idx = (mcc as usize) % MCC_TABLE_SIZE;
+        unsafe {
+            let p = self.base.add(self.mcc_table_off + idx * 2);
+            i16::from_le_bytes(*(p as *const [u8; 2]))
+        }
     }
 }

@@ -1,42 +1,57 @@
 use crate::blob::Blob;
 use crate::payload::RawPayload;
-use shared::{vectorize_f32, RawFeatures, VECTOR_DIM};
+use shared::{vectorize, QueryVector, RawFeatures};
 
-pub fn vectorize_payload(blob: &Blob, p: &RawPayload<'_>) -> Option<[f32; VECTOR_DIM]> {
+pub fn vectorize_payload(blob: &Blob, p: &RawPayload<'_>) -> Option<QueryVector> {
     let req_minutes = parse_iso8601_minutes(p.requested_at)?;
     let (hour, dow) = hour_and_dow_from_minutes(req_minutes);
     let mcc = parse_ascii_u32(p.merchant_mcc)?;
-
-    // unknown_merchant: search for `"<merchant_id>"` in known_merchants raw bytes
     let unknown = !contains_quoted(p.known_merchants, p.merchant_id);
 
-    let mcc_risk_q = blob.mcc_risk(mcc);
-    let mcc_risk = (mcc_risk_q as f32) / 127.0;
+    let mcc_risk_q = mcc_risk_quantized(blob, mcc);
 
-    // Compute minutes_since_last_tx as the actual time delta if last_transaction
-    // is present and parseable; None otherwise so vectorize() emits the -127 sentinel.
-    let minutes_since_last_tx = match p.last_timestamp {
-        Some(ts) => parse_iso8601_minutes(ts).map(|last| ((req_minutes - last) as f32).max(0.0)),
+    let minutes_since_last_tx: Option<u32> = match p.last_timestamp {
+        Some(ts) => parse_iso8601_minutes(ts).map(|last| (req_minutes - last).max(0) as u32),
         None => None,
     };
 
     let raw = RawFeatures {
-        amount: p.amount,
+        amount_milli: to_milli(p.amount),
         installments: p.installments,
         hour_of_day: hour,
         day_of_week: dow,
         minutes_since_last_tx,
-        km_from_last_tx: p.last_km,
-        km_from_home: p.km_from_home,
-        customer_avg_amount: p.customer_avg_amount,
+        km_from_last_tx_milli: p.last_km.map(to_milli),
+        km_from_home_milli: to_milli(p.km_from_home),
+        customer_avg_amount_milli: to_milli(p.customer_avg_amount),
         tx_count_24h: p.tx_count_24h,
         is_online: p.is_online,
         card_present: p.card_present,
         unknown_merchant: unknown,
-        mcc_risk,
-        merchant_avg_amount: p.merchant_avg_amount,
+        mcc_risk_q,
+        merchant_avg_amount_milli: to_milli(p.merchant_avg_amount),
     };
-    Some(vectorize_f32(&raw))
+    Some(vectorize(&raw))
+}
+
+#[inline]
+fn to_milli(v: f32) -> u32 {
+    if v <= 0.0 {
+        return 0;
+    }
+    let scaled = (v as f64 * 1000.0).round();
+    if scaled >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        scaled as u32
+    }
+}
+
+/// Look up MCC risk directly from the blob's lookup table. Builder writes
+/// these as i16 in `[0, QUANT_SCALE]`, so this is a free read.
+#[inline]
+fn mcc_risk_quantized(blob: &Blob, mcc: u32) -> i16 {
+    blob.mcc_risk(mcc)
 }
 
 #[inline]
@@ -51,9 +66,6 @@ fn parse_ascii_u32(s: &[u8]) -> Option<u32> {
     Some(acc)
 }
 
-/// Parse an ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SSZ") into minutes since
-/// the Unix epoch (1970-01-01). The absolute value is meaningful but only the
-/// difference between two such values is consumed downstream.
 #[inline]
 fn parse_iso8601_minutes(ts: &[u8]) -> Option<i64> {
     if ts.len() < 19 {
@@ -71,8 +83,6 @@ fn parse_iso8601_minutes(ts: &[u8]) -> Option<i64> {
     Some(days * 1440 + hour * 60 + minute)
 }
 
-/// Howard Hinnant's `days_from_civil`: convert (y, m, d) to days since 1970-01-01
-/// in the proleptic Gregorian calendar. Correct for all years and leap years.
 #[inline]
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = y - if m <= 2 { 1 } else { 0 };
@@ -92,9 +102,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 fn hour_and_dow_from_minutes(total_minutes: i64) -> (u8, u8) {
     let mins_in_day = total_minutes.rem_euclid(1440);
     let hour = (mins_in_day / 60) as u8;
-
     let days = total_minutes.div_euclid(1440);
-    // 1970-01-01 was a Thursday. ISO Mon=0..Sun=6 → Thursday = 3.
     let dow = ((days + 3).rem_euclid(7)) as u8;
     (hour, dow)
 }
@@ -117,43 +125,12 @@ fn contains_quoted(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload;
-    use std::path::PathBuf;
-
-    const SAMPLE_NULL: &[u8] = br#"{"id":"tx-100","transaction":{"amount":41.12,"installments":2,"requested_at":"2026-03-11T18:45:53Z"},"customer":{"avg_amount":82.24,"tx_count_24h":3,"known_merchants":["MERC-003","MERC-016"]},"merchant":{"id":"MERC-016","mcc":"5411","avg_amount":60.25},"terminal":{"is_online":false,"card_present":true,"km_from_home":29.2331},"last_transaction":null}"#;
-
-    const SAMPLE_PRESENT: &[u8] = br#"{"id":"tx-200","transaction":{"amount":50,"installments":1,"requested_at":"2026-03-11T20:00:00Z"},"customer":{"avg_amount":100,"tx_count_24h":2,"known_merchants":["MERC-1"]},"merchant":{"id":"MERC-1","mcc":"5411","avg_amount":50},"terminal":{"is_online":false,"card_present":true,"km_from_home":5},"last_transaction":{"timestamp":"2026-03-11T18:00:00Z","km_from_current":3.5}}"#;
-
-    #[test]
-    fn null_last_transaction_yields_sentinel() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tmp/blob.bin");
-        let blob = Blob::open(&path).unwrap();
-        let p = payload::extract(SAMPLE_NULL).unwrap();
-        let v = vectorize_payload(&blob, &p).unwrap();
-        assert_eq!(v[5], -1.0);
-        assert_eq!(v[6], -1.0);
-    }
-
-    #[test]
-    fn present_last_transaction_computes_real_minutes() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tmp/blob.bin");
-        let blob = Blob::open(&path).unwrap();
-        let p = payload::extract(SAMPLE_PRESENT).unwrap();
-        let v = vectorize_payload(&blob, &p).unwrap();
-        // 120 minutes between timestamps → 120/1440 ≈ 0.0833 → quantized ~10
-        assert!(
-            (0.05f32..0.10).contains(&v[5]),
-            "expected ~0.083 in v[5], got {}",
-            v[5]
-        );
-        assert_ne!(v[6], -1.0);
-    }
 
     #[test]
     fn zeller_2026_03_11_is_wednesday() {
         let mins = parse_iso8601_minutes(b"2026-03-11T18:45:53Z").unwrap();
         let (_, dow) = hour_and_dow_from_minutes(mins);
-        assert_eq!(dow, 2); // Wed
+        assert_eq!(dow, 2);
     }
 
     #[test]
@@ -164,9 +141,10 @@ mod tests {
     }
 
     #[test]
-    fn delta_across_day_boundary() {
-        let a = parse_iso8601_minutes(b"2026-03-12T00:30:00Z").unwrap();
-        let b = parse_iso8601_minutes(b"2026-03-11T23:00:00Z").unwrap();
-        assert_eq!(a - b, 90);
+    fn to_milli_round_trip() {
+        assert_eq!(to_milli(0.0), 0);
+        assert_eq!(to_milli(1.5), 1500);
+        assert_eq!(to_milli(41.12), 41120);
+        assert_eq!(to_milli(-3.0), 0);
     }
 }

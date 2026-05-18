@@ -1,234 +1,322 @@
 //! Types shared between the offline builder and the runtime server.
 //!
-//! Blob layout v3 (IVF SoA, little-endian):
+//! Blob layout v4 (KD-tree partitioned, little-endian):
 //!
 //! ```text
-//! [BlobHeader: 256 bytes]
-//! [centroids: NUM_CENTROIDS * VECTOR_DIM * 4 bytes (f32, dim-major SoA: dim 0 of all 8192, dim 1 of all 8192, ...)]
-//! [cluster_offsets: (NUM_CENTROIDS + 1) * 4 bytes (u32) — block offsets per cluster]
-//! [blocks: total_blocks * BLOCK_BYTES bytes — each block packs 8 vectors as i16 SoA: dim 0 slot 0..7, dim 1 slot 0..7, ...]
-//! [labels: padded_n bits packed in bytes, 1 bit per slot (block_id*8 + slot), 1 = fraud]
-//! [mcc_risk_table: 1024 bytes (i8 × 1024)]
+//! [BlobHeader: 64 bytes]
+//! [partitions: part_count × 76 bytes]
+//!   each: key u32, root i32, length i32, min [i16;16], max [i16;16]
+//! [nodes: node_count × 80 bytes]
+//!   each: left i32, right i32, start i32 (block idx), len i32,
+//!         min [i16;16], max [i16;16]
+//! [vectors: block_count × DIMS × LANES × 2 bytes]
+//!   per-block SoA: dim 0 lanes 0..7, dim 1 lanes 0..7, ..., dim 13 lanes 0..7
+//! [labels: block_count × LANES bytes (1 byte per slot)]
 //! ```
 //!
-//! Vectors are stored quantized as i16 with scale 8192 (~13 fractional bits) so
-//! each block is `BLOCK_VECS * VECTOR_DIM * 2` bytes. SoA layout lets a single
-//! `_mm_loadu_si128` pull all 8 lanes of one dimension; we then upcast to f32
-//! for FMA accumulation. Last block of each cluster pads with i16::MAX so the
-//! distance compute is enormous and those slots never enter the top-K.
+//! The format mirrors MXLange's `c-api-rinha2026`: partitioned KD-tree with
+//! per-node axis-aligned bounding boxes for branch pruning. Each query enters
+//! its primary partition first (selected by `partition_key` over discrete
+//! query features), and we DFS the tree skipping any subtree whose
+//! lower-bound distance to the query exceeds the current 5th-best neighbor.
+//! When the 5 best are within `EARLY_DISTANCE_LIMIT`, we stop globally.
 
-pub const MAGIC: [u8; 8] = *b"RINHA026";
-pub const VERSION: u32 = 3;
+pub const MAGIC: [u8; 8] = *b"GOKNN001";
+pub const VERSION: u32 = 4;
+
 pub const VECTOR_DIM: usize = 14;
+pub const PACKED_DIMS: usize = 16; // padding to 32-byte alignment for bbox arrays
+pub const QUANT_SCALE: i32 = 10000;
+pub const TOP_K: usize = 5;
+pub const LANES: usize = 8;
+
+pub const HEADER_SIZE: usize = 64;
+pub const PART_SIZE: usize = 76; // 4+4+4+32+32
+pub const NODE_SIZE: usize = 80; // 4+4+4+4+32+32
+pub const BLOCK_BYTES: usize = VECTOR_DIM * LANES * 2; // 14*8*i16 = 224
+/// MCC risk lookup table size (mcc % MCC_TABLE_SIZE → i16 risk).
 pub const MCC_TABLE_SIZE: usize = 1024;
 
-/// IVF parameters
-pub const NUM_CENTROIDS: u32 = 8192;
-pub const BLOCK_VECS: usize = 8;
-pub const BLOCK_BYTES: usize = BLOCK_VECS * VECTOR_DIM * 2; // 8 vecs * 14 dims * i16 = 224 bytes
-/// Quantization scale. Vectors are clamped to [-1, 1] then multiplied by SCALE
-/// before rounding to i16. SCALE=8192 leaves headroom (i16 max = 32767, max possible
-/// product after squaring = 67M; with FMA over 14 dims worst-case = 938M which fits in f32).
-pub const QUANT_SCALE: f32 = 8192.0;
-/// Inverse of `QUANT_SCALE`, applied at search time.
-pub const QUANT_INV_SCALE: f32 = 1.0 / 8192.0;
+pub const EARLY_DISTANCE_MILLI: i32 = 140;
+/// In i16-quantized space: ((SCALE * 140) / 1000)^2 = 1400^2 = 1_960_000.
+/// Squared L2 below this and we stop the whole search — top-5 are "very close".
+pub const EARLY_DISTANCE_LIMIT: i64 = {
+    let v = (QUANT_SCALE * EARLY_DISTANCE_MILLI / 1000) as i64;
+    v * v
+};
+
+pub type QueryVector = [i16; PACKED_DIMS];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlobHeader {
     pub magic: [u8; 8],
-    pub version: u32,
-    pub total_vectors: u32,
-    pub padded_n: u32, // total_blocks * BLOCK_VECS
-    pub total_blocks: u32,
-    pub k_centroids: u32, // NUM_CENTROIDS
-
-    pub centroids_offset: u32,       // f32 SoA, dim-major
-    pub cluster_offsets_offset: u32, // u32, length k_centroids + 1, block indices
-    pub blocks_offset: u32,          // i16 SoA blocks
-    pub labels_offset: u32,          // bits, length ceil(padded_n / 8)
-    pub mcc_table_offset: u32,       // i8 * 1024
-
-    pub blob_size: u32,
-    pub _padding: [u8; 204],
+    pub scale: u32,
+    pub dims: u32,
+    pub packed_dims: u32,
+    pub lanes: u32,
+    pub ref_count: u32,
+    pub part_count: u32,
+    pub node_count: u32,
+    pub block_count: u32,
+    /// Byte offset of the MCC risk table (MCC_TABLE_SIZE × i16).
+    pub mcc_table_offset: u32,
+    pub _padding: [u8; 20],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<BlobHeader>() == 256);
+    assert!(std::mem::size_of::<BlobHeader>() == HEADER_SIZE);
 };
 
 #[cfg(test)]
 mod header_tests {
     use super::*;
-
     #[test]
-    fn header_size_known() {
-        // sanity: must be a multiple of 8 (alignment-friendly) and reasonable
-        let sz = std::mem::size_of::<BlobHeader>();
-        assert!(sz % 8 == 0, "header size {} not 8-aligned", sz);
-        assert!(sz >= 200 && sz <= 320, "unexpected header size {sz}");
+    fn header_size_64() {
+        assert_eq!(std::mem::size_of::<BlobHeader>(), 64);
     }
-
     #[test]
-    fn magic_constant_value() {
-        assert_eq!(MAGIC, *b"RINHA026");
+    fn magic_value() {
+        assert_eq!(MAGIC, *b"GOKNN001");
     }
 }
 
-pub const MAX_AMOUNT: f32 = 10_000.0;
-pub const MAX_INSTALLMENTS: f32 = 12.0;
-pub const AMOUNT_VS_AVG_RATIO: f32 = 10.0;
-pub const MAX_MINUTES: f32 = 1440.0;
-pub const MAX_KM: f32 = 1000.0;
-pub const MAX_TX_COUNT_24H: f32 = 20.0;
-pub const MAX_MERCHANT_AVG_AMOUNT: f32 = 10_000.0;
+// ---------------------------------------------------------------------------
+// Quantization helpers (match MXLange's payload.c exactly so build/search
+// agree on every threshold, and partition_key buckets line up).
+// ---------------------------------------------------------------------------
 
-/// Map a value already in roughly `[-1.0, 1.0]` to `i8`. Saturating.
-/// Sentinel `-1.0` round-trips to `-127`. Values in `[0,1]` map to `[0, 127]`.
+/// `value` is expected to be in `[-1.0, 1.0]`. Maps to i16 scaled by QUANT_SCALE.
+/// Sentinel of `-1.0` round-trips to `-QUANT_SCALE`.
 #[inline]
-pub fn quantize_unit(v: f32) -> i8 {
-    let scaled = (v * 127.0).round();
-    if scaled >= 127.0 {
-        127
-    } else if scaled <= -127.0 {
-        -127
-    } else {
-        scaled as i8
+pub fn quantize_value(value: f64) -> i16 {
+    if value <= -1.0 {
+        return -(QUANT_SCALE as i16);
     }
+    if value <= 0.0 {
+        return 0;
+    }
+    if value >= 1.0 {
+        return QUANT_SCALE as i16;
+    }
+    let scaled = (value * QUANT_SCALE as f64).round();
+    scaled as i16
 }
 
 #[inline]
-pub fn clamp01(v: f32) -> f32 {
-    if v.is_nan() || v < 0.0 {
-        0.0
-    } else if v > 1.0 {
-        1.0
+fn clamp_quant_u64(v: u64) -> i16 {
+    if v >= QUANT_SCALE as u64 {
+        QUANT_SCALE as i16
     } else {
-        v
+        v as i16
     }
 }
 
-#[cfg(test)]
-mod feature_tests {
-    use super::*;
-
-    #[test]
-    fn quantize_unit_clamps_to_127() {
-        assert_eq!(quantize_unit(2.0), 127);
-    }
-    #[test]
-    fn quantize_unit_zero_is_zero() {
-        assert_eq!(quantize_unit(0.0), 0);
-    }
-    #[test]
-    fn quantize_unit_half_is_64() {
-        assert_eq!(quantize_unit(0.5), 64);
-    }
-    #[test]
-    fn quantize_unit_negative_clamps_to_minus_127() {
-        assert_eq!(quantize_unit(-1.0), -127);
-    }
+#[inline]
+fn div_round_u64(num: u64, denom: u64) -> u64 {
+    (num + denom / 2) / denom
 }
 
-/// Pre-normalized, parsed-out fields. Caller is responsible for deriving
-/// `hour_of_day`, `day_of_week`, `unknown_merchant`, `mcc_risk` from the raw payload.
+/// Map a non-negative integer in `[0, denominator]` to i16 scaled by QUANT_SCALE.
+#[inline]
+pub fn quantize_uint_div(value: u32, denominator: u32) -> i16 {
+    clamp_quant_u64(div_round_u64(
+        value as u64 * QUANT_SCALE as u64,
+        denominator as u64,
+    ))
+}
+
+/// Map a millis value (value * 1000) divided by `denominator_units` to i16.
+#[inline]
+pub fn quantize_milli_div(value_milli: u32, denominator_units: u32) -> i16 {
+    clamp_quant_u64(div_round_u64(
+        value_milli as u64 * QUANT_SCALE as u64,
+        denominator_units as u64 * 1000,
+    ))
+}
+
+/// `amount / avg`, clamped to `[0, SCALE]`. Matches the C ratio formula:
+/// `(amount_milli * 1000) / avg_milli`.
+#[inline]
+pub fn quantize_amount_ratio(amount_milli: u32, avg_milli: u32) -> i16 {
+    if avg_milli == 0 {
+        return QUANT_SCALE as i16;
+    }
+    clamp_quant_u64(div_round_u64(amount_milli as u64 * 1000, avg_milli as u64))
+}
+
+// ---------------------------------------------------------------------------
+// Feature input / vectorization
+// ---------------------------------------------------------------------------
+
+pub const MAX_AMOUNT_UNITS: u32 = 10_000;
+pub const MAX_INSTALLMENTS: u32 = 12;
+pub const MAX_HOUR: u32 = 23;
+pub const MAX_DOW: u32 = 6;
+pub const MAX_MINUTES: u32 = 1440;
+pub const MAX_KM_UNITS: u32 = 1000;
+pub const MAX_TX_COUNT_24H: u32 = 20;
+pub const MAX_MERCHANT_AVG_UNITS: u32 = 10_000;
+
+/// Parsed payload features in raw quantization-ready units. `milli` fields are
+/// value × 1000 (so floats with up to 3 decimals are represented exactly).
 #[derive(Debug, Clone, Copy)]
 pub struct RawFeatures {
-    pub amount: f32,
+    pub amount_milli: u32,
     pub installments: u32,
-    pub hour_of_day: u8, // 0..=23 UTC
-    pub day_of_week: u8, // Mon=0..Sun=6
-    pub minutes_since_last_tx: Option<f32>,
-    pub km_from_last_tx: Option<f32>,
-    pub km_from_home: f32,
-    pub customer_avg_amount: f32,
+    pub hour_of_day: u8,
+    pub day_of_week: u8,
+    pub minutes_since_last_tx: Option<u32>,
+    pub km_from_last_tx_milli: Option<u32>,
+    pub km_from_home_milli: u32,
+    pub customer_avg_amount_milli: u32,
     pub tx_count_24h: u32,
     pub is_online: bool,
     pub card_present: bool,
     pub unknown_merchant: bool,
-    pub mcc_risk: f32, // 0..=1, default 0.5
-    pub merchant_avg_amount: f32,
+    /// Pre-quantized mcc_risk in i16 space `[0, QUANT_SCALE]` — looked up from
+    /// the per-MCC table in the builder, hardcoded values at the API.
+    pub mcc_risk_q: i16,
+    pub merchant_avg_amount_milli: u32,
 }
 
-/// Same canonical vectorization, but returning unquantized f32 in the range
-/// [-1.0, 1.0] (with the `-1.0` sentinel where the original returned -127).
-/// The IVF SoA scan does its compute in f32, so we hand it the float values
-/// directly and let the search-side scan apply its own quantization scale.
+/// Produce a 16-dim i16 vector. Dims 0..14 are real features; 14..16 are 0
+/// padding so the `[i16; 16]` arrays align cleanly for AVX2 loads on bboxes.
 #[inline]
-pub fn vectorize_f32(r: &RawFeatures) -> [f32; VECTOR_DIM] {
-    let mut v = [0.0f32; VECTOR_DIM];
-
-    v[0] = clamp01(r.amount / MAX_AMOUNT);
-    v[1] = clamp01(r.installments as f32 / MAX_INSTALLMENTS);
-
-    let amount_vs_avg = if r.customer_avg_amount > 0.0 {
-        clamp01((r.amount / r.customer_avg_amount) / AMOUNT_VS_AVG_RATIO)
-    } else {
-        0.0
-    };
-    v[2] = amount_vs_avg;
-
-    v[3] = r.hour_of_day as f32 / 23.0;
-    v[4] = r.day_of_week as f32 / 6.0;
-
-    v[5] = match r.minutes_since_last_tx {
-        Some(m) => clamp01(m / MAX_MINUTES),
-        None => -1.0,
-    };
-    v[6] = match r.km_from_last_tx {
-        Some(k) => clamp01(k / MAX_KM),
-        None => -1.0,
-    };
-
-    v[7] = clamp01(r.km_from_home / MAX_KM);
-    v[8] = clamp01(r.tx_count_24h as f32 / MAX_TX_COUNT_24H);
-    v[9] = if r.is_online { 1.0 } else { 0.0 };
-    v[10] = if r.card_present { 1.0 } else { 0.0 };
-    v[11] = if r.unknown_merchant { 1.0 } else { 0.0 };
-    v[12] = clamp01(r.mcc_risk);
-    v[13] = clamp01(r.merchant_avg_amount / MAX_MERCHANT_AVG_AMOUNT);
-
-    v
-}
-
-#[inline]
-pub fn vectorize(r: &RawFeatures) -> [i8; VECTOR_DIM] {
-    let v_f32 = vectorize_f32(r);
-    let mut v = [0i8; VECTOR_DIM];
-    for i in 0..VECTOR_DIM {
-        v[i] = quantize_unit(v_f32[i]);
+pub fn vectorize(r: &RawFeatures) -> QueryVector {
+    let mut v: QueryVector = [0; PACKED_DIMS];
+    v[0] = quantize_milli_div(r.amount_milli, MAX_AMOUNT_UNITS);
+    v[1] = quantize_uint_div(r.installments, MAX_INSTALLMENTS);
+    v[2] = quantize_amount_ratio(r.amount_milli, r.customer_avg_amount_milli);
+    v[3] = quantize_uint_div(r.hour_of_day as u32, MAX_HOUR);
+    v[4] = quantize_uint_div(r.day_of_week as u32, MAX_DOW);
+    match r.minutes_since_last_tx {
+        Some(m) => v[5] = quantize_uint_div(m, MAX_MINUTES),
+        None => v[5] = -(QUANT_SCALE as i16),
     }
+    match r.km_from_last_tx_milli {
+        Some(km) => v[6] = quantize_milli_div(km, MAX_KM_UNITS),
+        None => v[6] = -(QUANT_SCALE as i16),
+    }
+    v[7] = quantize_milli_div(r.km_from_home_milli, MAX_KM_UNITS);
+    v[8] = quantize_uint_div(r.tx_count_24h, MAX_TX_COUNT_24H);
+    v[9] = if r.is_online { QUANT_SCALE as i16 } else { 0 };
+    v[10] = if r.card_present {
+        QUANT_SCALE as i16
+    } else {
+        0
+    };
+    v[11] = if r.unknown_merchant {
+        QUANT_SCALE as i16
+    } else {
+        0
+    };
+    v[12] = r.mcc_risk_q;
+    v[13] = quantize_milli_div(r.merchant_avg_amount_milli, MAX_MERCHANT_AVG_UNITS);
     v
+}
+
+// ---------------------------------------------------------------------------
+// Partitioning + lower-bound distance for KD-tree pruning
+// ---------------------------------------------------------------------------
+
+/// Build a discrete partition key from query features. Matches MXLange's
+/// `partition_key` exactly so a query and its true neighbors fall in the
+/// same partition with high probability.
+#[inline]
+pub fn partition_key(v: &QueryVector) -> u32 {
+    let mut key: u32 = 0;
+    if v[5] >= 0 {
+        key |= 1 << 0;
+    }
+    if v[9] > 0 {
+        key |= 1 << 1;
+    }
+    if v[10] > 0 {
+        key |= 1 << 2;
+    }
+    if v[11] > 0 {
+        key |= 1 << 3;
+    }
+    let mr = v[12];
+    if mr <= 2047 {
+        // bucket 0
+    } else if mr <= 4095 {
+        key |= 1 << 4;
+    } else if mr <= 6143 {
+        key |= 2 << 4;
+    } else {
+        key |= 3 << 4;
+    }
+    if v[2] > 4096 {
+        key |= 1 << 6;
+    }
+    if v[8] > 2048 {
+        key |= 1 << 7;
+    }
+    key
+}
+
+#[inline]
+fn lower_bound_dim(q: i16, lo: i16, hi: i16) -> i64 {
+    let diff: i64 = if q < lo {
+        lo as i64 - q as i64
+    } else if q > hi {
+        q as i64 - hi as i64
+    } else {
+        0
+    };
+    diff * diff
+}
+
+/// Sum of per-dim lower-bound contributions. Lower bound on squared L2 to
+/// any vector inside the axis-aligned box `[min, max]`. Cheap and correct.
+#[inline]
+pub fn lower_bound_vec(q: &QueryVector, min: &QueryVector, max: &QueryVector) -> i64 {
+    let mut acc: i64 = 0;
+    let mut d = 0;
+    while d < VECTOR_DIM {
+        acc += lower_bound_dim(q[d], min[d], max[d]);
+        d += 1;
+    }
+    acc
 }
 
 #[cfg(test)]
-mod vectorize_tests {
+mod helpers_tests {
     use super::*;
 
     #[test]
-    fn vectorize_known_legit_example() {
-        // tx-1329056812: amount 41.12, installments 2, hour 18 UTC, last_tx null
-        let raw = RawFeatures {
-            amount: 41.12,
-            installments: 2,
-            hour_of_day: 18,
-            day_of_week: 2, // Wed
-            minutes_since_last_tx: None,
-            km_from_last_tx: None,
-            km_from_home: 29.2331,
-            customer_avg_amount: 82.24,
-            tx_count_24h: 3,
-            is_online: false,
-            card_present: true,
-            unknown_merchant: false,
-            mcc_risk: 0.15,
-            merchant_avg_amount: 60.25,
-        };
-        let v = vectorize(&raw);
-        assert_eq!(v[5], -127); // sentinel for null minutes
-        assert_eq!(v[6], -127); // sentinel for null km
-        assert_eq!(v[9], 0); // is_online false
-        assert_eq!(v[10], 127); // card_present true
-        assert_eq!(v[11], 0); // merchant known
+    fn quantize_unit_endpoints() {
+        assert_eq!(quantize_value(-1.0), -10000);
+        assert_eq!(quantize_value(0.0), 0);
+        assert_eq!(quantize_value(0.5), 5000);
+        assert_eq!(quantize_value(1.0), 10000);
+    }
+
+    #[test]
+    fn partition_key_obvious() {
+        let mut v: QueryVector = [0; PACKED_DIMS];
+        // all-zero → key = 1 (bit 0 set because v[5]==0 >= 0)
+        assert_eq!(partition_key(&v), 0b00000001);
+        v[5] = -10000;
+        assert_eq!(partition_key(&v), 0); // sentinel last-tx clears bit 0
+    }
+
+    #[test]
+    fn lower_bound_zero_inside_box() {
+        let q: QueryVector = [100; PACKED_DIMS];
+        let lo: QueryVector = [50; PACKED_DIMS];
+        let hi: QueryVector = [200; PACKED_DIMS];
+        assert_eq!(lower_bound_vec(&q, &lo, &hi), 0);
+    }
+
+    #[test]
+    fn lower_bound_outside() {
+        let q: QueryVector = [300; PACKED_DIMS]; // beyond hi=200
+        let lo: QueryVector = [50; PACKED_DIMS];
+        let hi: QueryVector = [200; PACKED_DIMS];
+        // diff per dim = 100, squared = 10000, over 14 dims = 140000
+        assert_eq!(lower_bound_vec(&q, &lo, &hi), 14 * 10000);
     }
 }
