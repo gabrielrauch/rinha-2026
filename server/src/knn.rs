@@ -75,7 +75,7 @@ unsafe fn fraud_count_avx2(blob: &Blob, query: &QueryVector) -> u8 {
             break;
         }
     }
-    let mut probes = &mut buf[..n];
+    let probes = &mut buf[..n];
     probes.sort_by_key(|&(_, b)| b);
 
     for &(part_idx, lb) in probes.iter() {
@@ -167,7 +167,7 @@ unsafe fn scan_leaf(
     best_dists: &mut [i64; TOP_K],
     best_labels: &mut [u8; TOP_K],
 ) -> bool {
-    let blocks = ((len as usize) + LANES - 1) / LANES;
+    let blocks = (len as usize).div_ceil(LANES);
     let labels_ptr = blob.labels_ptr();
     let vectors_ptr = blob.vectors_ptr();
 

@@ -19,6 +19,6 @@ RUN cargo build -p lb --release
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
 COPY --from=builder /work/target/release/lb /lb
-ENV PORT=9999 UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock
+ENV PORT=9999 FD_UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock WORKERS=2
 EXPOSE 9999
 ENTRYPOINT ["/lb"]

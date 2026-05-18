@@ -15,6 +15,14 @@ fn main() -> anyhow::Result<()> {
         blob.block_count(),
     );
 
+    // FD-passing mode is preferred when available: the LB accepts TCP and
+    // hands the FD over to us via SCM_RIGHTS, so we never copy bytes between
+    // processes.
+    #[cfg(target_os = "linux")]
+    if let Ok(fd_sock_path) = std::env::var("RINHA_FD_SOCK") {
+        return server::fd_listen::run(blob, PathBuf::from(fd_sock_path).as_path());
+    }
+
     if let Ok(sock_path) = std::env::var("RINHA_SOCK") {
         run_uds(blob, PathBuf::from(sock_path))
     } else {

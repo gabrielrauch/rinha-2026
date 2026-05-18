@@ -1,4 +1,6 @@
 pub mod blob;
+#[cfg(target_os = "linux")]
+pub mod fd_listen;
 pub mod feature;
 pub mod index;
 pub mod knn;

@@ -9,6 +9,7 @@ name = "lb"
 path = "src/main.rs"
 
 [dependencies]
-monoio = { version = "0.2", features = ["iouring", "legacy", "macros"] }
-socket2 = "0.5"
 anyhow = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

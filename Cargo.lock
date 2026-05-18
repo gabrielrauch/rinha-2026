@@ -185,8 +185,7 @@ name = "lb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "monoio",
- "socket2",
+ "libc",
 ]
 
 [[package]]
