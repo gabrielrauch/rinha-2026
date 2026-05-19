@@ -17,7 +17,7 @@ use shared::{
     NODE_SIZE, PACKED_DIMS, PART_SIZE, QUANT_SCALE, VECTOR_DIM, VERSION,
 };
 
-pub const DEFAULT_LEAF_SIZE: usize = 64;
+pub const DEFAULT_LEAF_SIZE: usize = 128;
 
 pub struct BuildInputs<'a> {
     pub vectors: &'a [QueryVector],
