@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: ghcr.io/gabrielrauch/rinha-2026:02e72cb6df8fcc481cb27830cd7d0752d3c60a73
+    image: ghcr.io/gabrielrauch/rinha-2026:ed38fb4fbace6a473863ecf3ece455c5523063e1
     environment:
       - RINHA_FD_SOCK=/run/sock/api1.sock
     volumes:
@@ -21,7 +21,7 @@ services:
       - RINHA_FD_SOCK=/run/sock/api2.sock
 
   lb:
-    image: ghcr.io/gabrielrauch/rinha-2026-lb:02e72cb6df8fcc481cb27830cd7d0752d3c60a73
+    image: ghcr.io/gabrielrauch/rinha-2026-lb:ed38fb4fbace6a473863ecf3ece455c5523063e1
     restart: always
     depends_on:
       - api1
