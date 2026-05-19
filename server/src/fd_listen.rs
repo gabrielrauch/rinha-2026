@@ -51,13 +51,14 @@ pub fn run(blob: Arc<Blob>, sock_path: &Path) -> Result<()> {
         .expect("monoio runtime build");
     rt.block_on(async move {
         let std_wake = unsafe { std::os::unix::net::UnixStream::from_raw_fd(wake_reader_fd) };
-        std_wake.set_nonblocking(false).ok();
+        // monoio (both io_uring and legacy backends) requires non-blocking FDs.
+        std_wake.set_nonblocking(true).ok();
         let mut wake = UnixStream::from_std(std_wake)?;
-        let mut buf = vec![0u8; 256];
         loop {
-            // Block until LB sends us at least one FD.
-            let (res, b) = wake.read(buf).await;
-            buf = b;
+            // Block until LB writes at least one wake byte. Fresh Vec each
+            // iteration is cheap (64B alloc) and keeps the buffer math trivial.
+            let buf = vec![0u8; 64];
+            let (res, _b) = wake.read(buf).await;
             match res {
                 Ok(0) => break,
                 Ok(_) => {
@@ -84,12 +85,6 @@ pub fn run(blob: Arc<Blob>, sock_path: &Path) -> Result<()> {
                     eprintln!("wake socket read failed: {e}");
                     break;
                 }
-            }
-            // Resize buf back to read capacity since `read` may have shrunk it.
-            if buf.capacity() < 256 {
-                buf = vec![0u8; 256];
-            } else {
-                unsafe { buf.set_len(buf.capacity()) };
             }
         }
         Ok::<_, anyhow::Error>(())

@@ -50,19 +50,19 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
 
-    // Wait for upstreams to come up — they may still be opening their UDS
-    // listener at LB start. We don't want to crash if the LB races the API.
+    // Bind the TCP listener FIRST so the rinha health check sees port 9999
+    // open immediately (kernel queues pending accepts in the backlog while
+    // we set up workers). Only THEN wait for upstreams.
+    let listener_fd = create_tcp_listener(port)
+        .map_err(|e| anyhow::anyhow!("create TCP listener on :{port}: {e}"))?;
     eprintln!(
-        "lb starting port={} workers={} upstreams={}",
+        "lb listening port={} workers={} upstreams={}",
         port,
         workers,
         upstreams.len()
     );
     wait_upstreams(&upstreams);
     eprintln!("lb upstreams ready");
-
-    let listener_fd = create_tcp_listener(port)
-        .map_err(|e| anyhow::anyhow!("create TCP listener on :{port}: {e}"))?;
     let upstreams = Arc::new(upstreams);
     let next = Arc::new(AtomicUsize::new(0));
 
