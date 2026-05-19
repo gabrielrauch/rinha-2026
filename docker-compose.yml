@@ -1,8 +1,8 @@
 services:
   api1: &api
-    image: ghcr.io/gabrielrauch/rinha-2026:92cae5c434c0a0dfe38f0ebdb70c70ee5cc8a12f
+    image: ghcr.io/gabrielrauch/rinha-2026:53db4ae43f366750ad7529349b4f3a33ac6bd036
     environment:
-      - RINHA_SOCK=/run/sock/api1.sock
+      - RINHA_FD_SOCK=/run/sock/api1.sock
     volumes:
       - sock:/run/sock
     deploy:
@@ -20,17 +20,18 @@ services:
   api2:
     <<: *api
     environment:
-      - RINHA_SOCK=/run/sock/api2.sock
+      - RINHA_FD_SOCK=/run/sock/api2.sock
 
   lb:
-    image: ghcr.io/gabrielrauch/rinha-2026-lb:92cae5c434c0a0dfe38f0ebdb70c70ee5cc8a12f
+    image: ghcr.io/gabrielrauch/rinha-2026-lb:53db4ae43f366750ad7529349b4f3a33ac6bd036
     restart: always
     depends_on:
       - api1
       - api2
     environment:
       - PORT=9999
-      - UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock
+      - FD_UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock
+      - WORKERS=2
     ports:
       - "9999:9999"
     volumes:
