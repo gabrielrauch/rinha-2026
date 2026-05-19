@@ -1,6 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Replace the system allocator with mimalloc on Linux: per-thread free lists
+// + segment caching cut the per-request alloc/free cost in the hot path
+// (HTTP buf reuse, monoio task spawn, scan_leaf scratch arrays).
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Per-process listener: UDS when RINHA_SOCK is set (production path through HAProxy
 // unix@... backends — eliminates TCP loopback overhead). Falls back to TCP for local
 // `cargo run` without compose.
